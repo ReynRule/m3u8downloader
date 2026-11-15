@@ -27,7 +27,11 @@ import javax.crypto.spec.SecretKeySpec
  * 병렬 세그먼트 다운로드 -> (AES-128 복호화) -> 순서대로 병합 -> (선택) MP4 변환 -> 갤러리(Movies) 저장
  */
 object Downloader {
-    private const val THREADS = 4
+    // 동시 다운로드 조각 수: START 에서 시작해 성공이 이어지면 MAX 까지 늘리고,
+    // 서버가 제한(429/5xx/연결 끊김)을 걸면 MIN 까지 줄인다 (적응형).
+    private const val MIN_THREADS = 4
+    private const val START_THREADS = 8
+    private const val MAX_THREADS = 12
 
     suspend fun run(ctx: Context, itemId: String) {
         withContext(Dispatchers.IO) { doRun(ctx, itemId) }
@@ -58,6 +62,20 @@ object Downloader {
             }
         }
 
+        // 적응형 동시성 상태
+        val limit = AtomicInteger(START_THREADS)
+        val okStreak = AtomicInteger(0)
+        val onOk: () -> Unit = {
+            if (okStreak.incrementAndGet() >= 15) {
+                okStreak.set(0)
+                limit.updateAndGet { minOf(MAX_THREADS, it + 1) }
+            }
+        }
+        val onThrottle: (Exception) -> Unit = {
+            okStreak.set(0)
+            limit.updateAndGet { maxOf(MIN_THREADS, it - 2) }
+        }
+
         val keyCache = ConcurrentHashMap<String, ByteArray>()
         suspend fun keyFor(uri: String): ByteArray {
             keyCache[uri]?.let { return it }
@@ -75,19 +93,29 @@ object Downloader {
             report(done.incrementAndGet())
         }
 
+        // 암호화 키는 미리 한 번씩만 받아 둠 (워커들이 동시에 같은 키를 중복 요청하지 않도록)
+        segs.mapNotNull { if (it.keyMethod == "AES-128") it.keyUri else null }
+            .distinct().forEach { keyFor(it) }
+
         // 병렬 다운로드 (이미 받은 조각은 건너뜀 -> 이어받기)
         val next = AtomicInteger(0)
         coroutineScope {
-            repeat(THREADS) {
+            repeat(MAX_THREADS) { w ->
                 launch {
                     while (true) {
                         ensureActive()
+                        // 현재 허용 동시성보다 번호가 큰 워커는 대기 (서버 제한 시 자동 감속)
+                        if (w >= limit.get()) {
+                            if (next.get() >= segs.size) break
+                            delay(200)
+                            continue
+                        }
                         val i = next.getAndIncrement()
                         if (i >= segs.size) break
                         val out = File(dir, "%06d.seg".format(i))
                         if (!(out.exists() && out.length() > 0)) {
                             val s = segs[i]
-                            var data = fetchBytes(s.url, item, s.rangeStart, s.rangeLen)
+                            var data = fetchBytes(s.url, item, s.rangeStart, s.rangeLen, onThrottle)
                             if (s.keyMethod == "AES-128" && s.keyUri != null) {
                                 data = decrypt(data, keyFor(s.keyUri), ivFor(s))
                             }
@@ -95,6 +123,7 @@ object Downloader {
                             val tmp = File(dir, "%06d.tmp".format(i))
                             tmp.writeBytes(data)
                             if (!tmp.renameTo(out)) throw IOException("파일 저장 실패")
+                            onOk()
                         }
                         report(done.incrementAndGet())
                     }
@@ -180,7 +209,10 @@ object Downloader {
     /** HTTP 오류 (재시도 판단용) */
     private class HttpErr(val code: Int, val retryAfterMs: Long) : IOException("HTTP $code")
 
-    internal suspend fun fetchBytes(url: String, item: VideoItem, start: Long, len: Long): ByteArray {
+    internal suspend fun fetchBytes(
+        url: String, item: VideoItem, start: Long, len: Long,
+        onThrottle: ((Exception) -> Unit)? = null
+    ): ByteArray {
         var last: Exception? = null
         val max = 7
         for (attempt in 0 until max) {
@@ -200,6 +232,8 @@ object Downloader {
                 throw e
             } catch (e: Exception) {
                 last = e
+                // 속도 제한/서버 오류/연결 끊김이면 호출 측이 동시성을 낮출 수 있게 알림
+                if (e !is HttpErr || e.code == 429 || e.code >= 500) onThrottle?.invoke(e)
                 // 영구 오류(없음/권한/잘못된 요청)는 오래 재시도하지 않음
                 if (e is HttpErr && (e.code == 404 || e.code == 410 || e.code == 400) && attempt >= 1) break
                 if (attempt == max - 1) break

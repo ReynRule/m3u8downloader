@@ -32,6 +32,9 @@ class BrowserFragment : Fragment() {
     @Volatile private var ua = ""
     private var retryUrl = ""
     private var retryCount = 0
+    private var autoRetrying = false      // 우리가 자동 재시도로 로드를 시작한 직후인지
+    private var loadFailed = false        // 현재 로드가 메인 프레임 오류로 끝났는지
+    private var pendingRetry: Runnable? = null
 
     private var customView: View? = null
     private var customCb: WebChromeClient.CustomViewCallback? = null
@@ -85,22 +88,35 @@ class BrowserFragment : Fragment() {
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 super.onReceivedError(view, request, error)
                 if (request?.isForMainFrame != true || view == null) return
+                loadFailed = true
                 val code = error?.errorCode ?: return
-                val transient = code == WebViewClient.ERROR_CONNECT || code == WebViewClient.ERROR_IO ||
-                    code == WebViewClient.ERROR_TIMEOUT || code == WebViewClient.ERROR_UNKNOWN
+                val desc = error?.description?.toString().orEmpty()
+                if (!isTransientError(code, desc)) return
                 val failed = request.url.toString()
-                if (!transient) return
                 if (failed != retryUrl) {
                     retryUrl = failed
                     retryCount = 0
                 }
-                if (retryCount < 3) {
-                    retryCount++
-                    view.postDelayed({ if (_b != null) view.loadUrl(failed) }, 800L * retryCount)
+                if (retryCount >= RETRY_DELAYS.size) return
+                val delayMs = RETRY_DELAYS[retryCount]
+                retryCount++
+                _b?.progress?.visibility = View.VISIBLE
+                cancelPendingRetry()
+                val r = Runnable {
+                    pendingRetry = null
+                    if (_b != null) {
+                        autoRetrying = true
+                        view.loadUrl(failed)
+                    }
                 }
+                pendingRetry = r
+                view.postDelayed(r, delayMs)
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                loadFailed = false
+                // 사용자가 직접 연 로드(주소 입력/새로고침/링크)면 재시도 횟수를 처음부터
+                if (autoRetrying) autoRetrying = false else retryCount = 0
                 curUrl = url ?: ""
                 _b?.let {
                     it.progress.visibility = View.VISIBLE
@@ -109,7 +125,8 @@ class BrowserFragment : Fragment() {
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
-                _b?.progress?.visibility = View.INVISIBLE
+                if (!loadFailed) retryCount = 0
+                if (!loadFailed || pendingRetry == null) _b?.progress?.visibility = View.INVISIBLE
                 CookieManager.getInstance().flush()
             }
 
@@ -150,7 +167,11 @@ class BrowserFragment : Fragment() {
 
         b.btnBack.setOnClickListener { goBackIfPossible() }
         b.btnForward.setOnClickListener { if (wv.canGoForward()) wv.goForward() }
-        b.btnReload.setOnClickListener { wv.reload() }
+        b.btnReload.setOnClickListener {
+            cancelPendingRetry()
+            retryCount = 0
+            wv.reload()
+        }
         b.url.setOnEditorActionListener { _, actionId, event ->
             if (actionId == EditorInfo.IME_ACTION_GO ||
                 (event != null && event.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN)
@@ -171,11 +192,25 @@ class BrowserFragment : Fragment() {
             t.contains(" ") || !t.contains(".") -> "https://www.google.com/search?q=" + Uri.encode(t)
             else -> "https://$t"
         }
+        cancelPendingRetry()
+        retryCount = 0
         b.web.loadUrl(u)
         val imm = requireContext().getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(b.url.windowToken, 0)
         b.url.clearFocus()
         b.web.requestFocus()
+    }
+
+    private fun cancelPendingRetry() {
+        pendingRetry?.let { _b?.web?.removeCallbacks(it) }
+        pendingRetry = null
+    }
+
+    /** ERR_CONNECTION_RESET 처럼 다시 시도하면 되는 일시적 네트워크 오류인지 */
+    private fun isTransientError(code: Int, desc: String): Boolean {
+        if (TRANSIENT_NAMES.any { desc.contains(it, ignoreCase = true) }) return true
+        return code == WebViewClient.ERROR_CONNECT || code == WebViewClient.ERROR_IO ||
+            code == WebViewClient.ERROR_TIMEOUT || code == WebViewClient.ERROR_UNKNOWN
     }
 
     fun goBackIfPossible(): Boolean {
@@ -219,6 +254,7 @@ class BrowserFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        cancelPendingRetry()
         _b?.web?.let {
             (it.parent as? ViewGroup)?.removeView(it)
             it.destroy()
@@ -229,5 +265,16 @@ class BrowserFragment : Fragment() {
 
     companion object {
         private const val HOME = "https://www.google.com"
+
+        // 자동 재시도 간격(ms): 짧게 여러 번 -> 대부분 1~2번째에서 붙음
+        private val RETRY_DELAYS = longArrayOf(250, 500, 900, 1500, 2500, 4000)
+
+        private val TRANSIENT_NAMES = listOf(
+            "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_ABORTED",
+            "ERR_CONNECTION_TIMED_OUT", "ERR_TIMED_OUT", "ERR_EMPTY_RESPONSE",
+            "ERR_SSL_PROTOCOL_ERROR", "ERR_HTTP2_PROTOCOL_ERROR", "ERR_QUIC_PROTOCOL_ERROR",
+            "ERR_NETWORK_CHANGED", "ERR_SOCKET_NOT_CONNECTED", "ERR_NETWORK_IO_SUSPENDED",
+            "ERR_INCOMPLETE_CHUNKED_ENCODING", "ERR_CONTENT_LENGTH_MISMATCH"
+        )
     }
 }

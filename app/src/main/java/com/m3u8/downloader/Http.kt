@@ -15,7 +15,7 @@ object Http {
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
-        .connectionPool(okhttp3.ConnectionPool(8, 30, TimeUnit.SECONDS))
+        .connectionPool(okhttp3.ConnectionPool(32, 5, TimeUnit.MINUTES))
         .build()
 
     fun hostOf(u: String): String = u.toHttpUrlOrNull()?.host ?: ""
