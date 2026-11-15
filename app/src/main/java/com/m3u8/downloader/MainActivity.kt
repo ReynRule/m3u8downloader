@@ -118,7 +118,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 웹 영상 전체화면 진입/해제 */
-    fun setImmersive(on: Boolean) {
+    fun setVideoFullscreen(on: Boolean) {
         b.nav.visibility = if (on) View.GONE else View.VISIBLE
         val c = WindowCompat.getInsetsController(window, window.decorView)
         if (on) {

@@ -119,7 +119,7 @@ class BrowserFragment : Fragment() {
                 customCb = callback
                 b.fullscreen.addView(view)
                 b.fullscreen.visibility = View.VISIBLE
-                (activity as? MainActivity)?.setImmersive(true)
+                (activity as? MainActivity)?.setVideoFullscreen(true)
             }
 
             override fun onHideCustomView() {
@@ -178,7 +178,7 @@ class BrowserFragment : Fragment() {
         customCb?.onCustomViewHidden()
         customView = null
         customCb = null
-        (activity as? MainActivity)?.setImmersive(false)
+        (activity as? MainActivity)?.setVideoFullscreen(false)
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
