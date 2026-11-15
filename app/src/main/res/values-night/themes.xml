@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.M3U8" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#A5B4FC</item>
+        <item name="colorOnPrimary">#1E1B4B</item>
+        <item name="colorSecondary">#67E8F9</item>
+    </style>
+</resources>
