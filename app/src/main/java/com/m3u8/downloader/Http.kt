@@ -14,6 +14,8 @@ object Http {
         .readTimeout(40, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
+        .retryOnConnectionFailure(true)
+        .connectionPool(okhttp3.ConnectionPool(8, 30, TimeUnit.SECONDS))
         .build()
 
     fun hostOf(u: String): String = u.toHttpUrlOrNull()?.host ?: ""
@@ -34,15 +36,26 @@ object Http {
         return if (hostOf(url) == hostOf(item.sourceUrl)) item.cookie else ""
     }
 
-    /** 브라우저에서 감지했을 때와 동일한 UA / Referer / Cookie 로 요청 */
-    fun request(url: String, item: VideoItem): Request.Builder {
+    /**
+     * 브라우저에서 감지했을 때와 동일한 UA / Referer / Cookie 로 요청.
+     * [light] 이면 Origin / Sec-Fetch 등을 빼고 최소 헤더만 (일부 서버는 이 헤더 조합에서 500 을 냄)
+     */
+    fun request(url: String, item: VideoItem, light: Boolean = false): Request.Builder {
         val b = Request.Builder().url(url)
         try {
             if (item.userAgent.isNotBlank()) b.header("User-Agent", item.userAgent)
+            b.header("Accept", "*/*")
+            b.header("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
             val ref = item.referer.ifBlank { item.pageUrl }
             if (ref.isNotBlank()) {
                 b.header("Referer", ref)
-                originOf(ref)?.let { b.header("Origin", it) }
+                if (!light) {
+                    originOf(ref)?.let { b.header("Origin", it) }
+                    val same = hostOf(ref) == hostOf(url)
+                    b.header("Sec-Fetch-Dest", "empty")
+                    b.header("Sec-Fetch-Mode", "cors")
+                    b.header("Sec-Fetch-Site", if (same) "same-origin" else "cross-site")
+                }
             }
             val cookie = cookieFor(url, item)
             if (cookie.isNotBlank()) b.header("Cookie", cookie)

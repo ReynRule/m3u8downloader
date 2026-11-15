@@ -27,7 +27,7 @@ import javax.crypto.spec.SecretKeySpec
  * 병렬 세그먼트 다운로드 -> (AES-128 복호화) -> 순서대로 병합 -> (선택) MP4 변환 -> 갤러리(Movies) 저장
  */
 object Downloader {
-    private const val THREADS = 6
+    private const val THREADS = 4
 
     suspend fun run(ctx: Context, itemId: String) {
         withContext(Dispatchers.IO) { doRun(ctx, itemId) }
@@ -177,25 +177,38 @@ object Downloader {
         }
     }
 
+    /** HTTP 오류 (재시도 판단용) */
+    private class HttpErr(val code: Int, val retryAfterMs: Long) : IOException("HTTP $code")
+
     internal suspend fun fetchBytes(url: String, item: VideoItem, start: Long, len: Long): ByteArray {
         var last: Exception? = null
-        for (attempt in 0 until 4) {
+        val max = 7
+        for (attempt in 0 until max) {
             currentCoroutineContext().ensureActive()
             try {
-                val rb = Http.request(url, item)
+                // 앞쪽 시도는 브라우저와 같은 헤더, 뒤쪽 시도(500 등이 계속될 때)는 최소 헤더로
+                val rb = Http.request(url, item, light = attempt >= 3)
                 if (len > 0) rb.header("Range", "bytes=$start-${start + len - 1}")
                 Http.client.newCall(rb.build()).execute().use { r ->
-                    if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+                    if (!r.isSuccessful) {
+                        val ra = (r.header("Retry-After")?.trim()?.toLongOrNull() ?: 0L) * 1000L
+                        throw HttpErr(r.code, ra)
+                    }
                     return r.body!!.bytes()
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 last = e
-                delay(600L * (attempt + 1))
+                // 영구 오류(없음/권한/잘못된 요청)는 오래 재시도하지 않음
+                if (e is HttpErr && (e.code == 404 || e.code == 410 || e.code == 400) && attempt >= 1) break
+                if (attempt == max - 1) break
+                val backoff = minOf(8000L, 700L * (1L shl attempt)) + (0..400).random()
+                val wait = if (e is HttpErr) maxOf(backoff, minOf(e.retryAfterMs, 15000L)) else backoff
+                delay(wait)
             }
         }
-        throw IOException("다운로드 실패: ${last?.message ?: "알 수 없는 오류"}")
+        throw IOException("다운로드 실패: ${last?.message ?: "알 수 없는 오류"} (${Http.hostOf(url)})")
     }
 
     private fun decrypt(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {

@@ -15,11 +15,11 @@ import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
-/** 다운로드 큐 관리 (동시에 2개 영상, 영상당 6개 조각 병렬) */
+/** 다운로드 큐 관리 (한 번에 1개 영상, 영상당 4개 조각 병렬) */
 object DownloadCenter {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val jobs = ConcurrentHashMap<String, Job>()
-    private val sem = Semaphore(2)
+    private val sem = Semaphore(1)
 
     fun enqueue(ctx: Context, ids: Collection<String>) {
         val targets = ids.filter { id ->

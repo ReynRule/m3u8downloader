@@ -13,6 +13,7 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -29,6 +30,8 @@ class BrowserFragment : Fragment() {
     @Volatile private var curUrl = ""
     @Volatile private var curTitle = ""
     @Volatile private var ua = ""
+    private var retryUrl = ""
+    private var retryCount = 0
 
     private var customView: View? = null
     private var customCb: WebChromeClient.CustomViewCallback? = null
@@ -77,6 +80,24 @@ class BrowserFragment : Fragment() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val scheme = request?.url?.scheme ?: return false
                 return scheme !in setOf("http", "https", "about", "data", "blob", "javascript")
+            }
+
+            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                super.onReceivedError(view, request, error)
+                if (request?.isForMainFrame != true || view == null) return
+                val code = error?.errorCode ?: return
+                val transient = code == WebViewClient.ERROR_CONNECT || code == WebViewClient.ERROR_IO ||
+                    code == WebViewClient.ERROR_TIMEOUT || code == WebViewClient.ERROR_UNKNOWN
+                val failed = request.url.toString()
+                if (!transient) return
+                if (failed != retryUrl) {
+                    retryUrl = failed
+                    retryCount = 0
+                }
+                if (retryCount < 3) {
+                    retryCount++
+                    view.postDelayed({ if (_b != null) view.loadUrl(failed) }, 800L * retryCount)
+                }
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
