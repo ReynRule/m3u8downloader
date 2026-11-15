@@ -16,6 +16,7 @@ data class VideoItem(
     val pageUrl: String,
     val sourceUrl: String,
     val mediaUrl: String = "",
+    val audioUrl: String = "",
     val userAgent: String = "",
     val cookie: String = "",
     val referer: String = "",

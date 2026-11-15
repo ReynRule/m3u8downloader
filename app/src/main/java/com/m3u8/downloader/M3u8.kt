@@ -5,7 +5,10 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 /** HLS(m3u8) 재생목록 파서 */
 object M3u8 {
 
-    data class Variant(val url: String, val bandwidth: Long, val width: Int, val height: Int) {
+    data class Variant(
+        val url: String, val bandwidth: Long, val width: Int, val height: Int,
+        val audioGroup: String = ""
+    ) {
         fun label(): String = when {
             height > 0 -> "${height}p"
             bandwidth > 0 -> "${bandwidth / 1000}kbps"
@@ -60,12 +63,33 @@ object M3u8 {
                     val w = res?.getOrNull(0)?.toIntOrNull() ?: 0
                     val h = res?.getOrNull(1)?.toIntOrNull() ?: 0
                     val bw = p["BANDWIDTH"]?.toLongOrNull() ?: p["AVERAGE-BANDWIDTH"]?.toLongOrNull() ?: 0L
-                    out.add(Variant(resolve(base, line), bw, w, h))
+                    out.add(Variant(resolve(base, line), bw, w, h, p["AUDIO"] ?: ""))
                     pending = null
                 }
             }
         }
         return out
+    }
+
+    /** master 의 별도 오디오 트랙(#EXT-X-MEDIA:TYPE=AUDIO, URI 있는 것) */
+    class AudioRendition(val url: String, val group: String, val name: String, val isDefault: Boolean)
+
+    /**
+     * [variant] 가 가리키는 오디오 그룹에서 별도 파일로 제공되는 오디오 하나를 고른다.
+     * URI 가 없으면(= 소리가 영상 안에 들어 있음) null.
+     */
+    fun pickAudio(text: String, base: String, variant: Variant): AudioRendition? {
+        if (variant.audioGroup.isBlank()) return null
+        val list = ArrayList<AudioRendition>()
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
+            if (!line.startsWith("#EXT-X-MEDIA:")) continue
+            val a = attrs(line.substringAfter(':'))
+            if (a["TYPE"] != "AUDIO" || a["GROUP-ID"] != variant.audioGroup) continue
+            val uri = a["URI"] ?: continue
+            list.add(AudioRendition(resolve(base, uri), variant.audioGroup, a["NAME"] ?: "", a["DEFAULT"] == "YES"))
+        }
+        return list.firstOrNull { it.isDefault } ?: list.firstOrNull()
     }
 
     /** master 재생목록의 자막 트랙(#EXT-X-MEDIA:TYPE=SUBTITLES). 강제 자막(FORCED=YES)은 제외 */

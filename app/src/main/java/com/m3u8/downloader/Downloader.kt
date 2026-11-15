@@ -47,8 +47,15 @@ object Downloader {
         if (segs.isEmpty()) throw IOException("영상 조각(segment)이 없습니다")
         val fmp4 = media.mapUrl != null
 
+        // 소리가 영상과 따로 있는 HLS(별도 오디오 트랙)
+        val apl = Repo.audioPlaylistFile(itemId)
+        val amedia = if (item.audioUrl.isNotBlank() && apl.exists()) M3u8.parseMedia(apl.readText(), item.audioUrl) else null
+        val asegs = amedia?.segments ?: emptyList()
+        val hasAudio = asegs.isNotEmpty()
+        val afmp4 = hasAudio && amedia?.mapUrl != null
+
         val dir = File(ctx.filesDir, "dl/$itemId").apply { mkdirs() }
-        val total = segs.size + (if (fmp4) 1 else 0)
+        val total = segs.size + asegs.size + (if (fmp4) 1 else 0) + (if (afmp4) 1 else 0)
         val done = AtomicInteger(0)
         val lastTs = AtomicLong(0)
 
@@ -84,7 +91,7 @@ object Downloader {
             return k
         }
 
-        // fMP4 초기화 세그먼트
+        // fMP4 초기화 세그먼트 (영상 / 오디오)
         val initFile = File(dir, "init.bin")
         if (fmp4) {
             if (!initFile.exists() || initFile.length() == 0L) {
@@ -92,9 +99,22 @@ object Downloader {
             }
             report(done.incrementAndGet())
         }
+        val ainitFile = File(dir, "ainit.bin")
+        if (afmp4) {
+            if (!ainitFile.exists() || ainitFile.length() == 0L) {
+                ainitFile.writeBytes(fetchBytes(amedia!!.mapUrl!!, item, 0, -1))
+            }
+            report(done.incrementAndGet())
+        }
+
+        // 영상 + 오디오 조각을 하나의 작업 목록으로 합쳐 같은 워커 풀에서 병렬 처리
+        class Task(val seg: M3u8.Segment, val name: String, val stripHeader: Boolean)
+        val tasks = ArrayList<Task>(segs.size + asegs.size)
+        segs.forEachIndexed { i, s -> tasks.add(Task(s, "%06d.seg".format(i), !fmp4)) }
+        asegs.forEachIndexed { i, s -> tasks.add(Task(s, "a%06d.seg".format(i), !afmp4)) }
 
         // 암호화 키는 미리 한 번씩만 받아 둠 (워커들이 동시에 같은 키를 중복 요청하지 않도록)
-        segs.mapNotNull { if (it.keyMethod == "AES-128") it.keyUri else null }
+        tasks.mapNotNull { if (it.seg.keyMethod == "AES-128") it.seg.keyUri else null }
             .distinct().forEach { keyFor(it) }
 
         // 병렬 다운로드 (이미 받은 조각은 건너뜀 -> 이어받기)
@@ -106,21 +126,22 @@ object Downloader {
                         ensureActive()
                         // 현재 허용 동시성보다 번호가 큰 워커는 대기 (서버 제한 시 자동 감속)
                         if (w >= limit.get()) {
-                            if (next.get() >= segs.size) break
+                            if (next.get() >= tasks.size) break
                             delay(200)
                             continue
                         }
                         val i = next.getAndIncrement()
-                        if (i >= segs.size) break
-                        val out = File(dir, "%06d.seg".format(i))
+                        if (i >= tasks.size) break
+                        val t = tasks[i]
+                        val out = File(dir, t.name)
                         if (!(out.exists() && out.length() > 0)) {
-                            val s = segs[i]
+                            val s = t.seg
                             var data = fetchBytes(s.url, item, s.rangeStart, s.rangeLen, onThrottle)
                             if (s.keyMethod == "AES-128" && s.keyUri != null) {
                                 data = decrypt(data, keyFor(s.keyUri), ivFor(s))
                             }
-                            if (!fmp4) data = stripFakeHeader(data)
-                            val tmp = File(dir, "%06d.tmp".format(i))
+                            if (t.stripHeader) data = stripFakeHeader(data)
+                            val tmp = File(dir, t.name.removeSuffix(".seg") + ".tmp")
                             tmp.writeBytes(data)
                             if (!tmp.renameTo(out)) throw IOException("파일 저장 실패")
                             onOk()
@@ -133,20 +154,42 @@ object Downloader {
 
         // 병합
         Repo.update(itemId) { it.copy(status = Status.MERGING, progress = 100) }
-        val merged = File(dir, if (fmp4) "merged.mp4" else "merged.ts")
-        merged.outputStream().buffered(1 shl 16).use { os ->
-            if (fmp4) os.write(initFile.readBytes())
-            for (i in segs.indices) {
-                currentCoroutineContext().ensureActive()
-                val f = File(dir, "%06d.seg".format(i))
-                f.inputStream().use { it.copyTo(os) }
-                f.delete()
+        suspend fun mergeStream(dst: File, init: File?, names: List<String>) {
+            dst.outputStream().buffered(1 shl 16).use { os ->
+                if (init != null) os.write(init.readBytes())
+                for (n in names) {
+                    currentCoroutineContext().ensureActive()
+                    val f = File(dir, n)
+                    f.inputStream().use { it.copyTo(os) }
+                    f.delete()
+                }
             }
         }
+        val merged = File(dir, if (fmp4) "merged.mp4" else "merged.ts")
+        mergeStream(merged, if (fmp4) initFile else null, tasks.filter { !it.name.startsWith("a") }.map { it.name })
 
         var finalFile = merged
         var mime = if (fmp4) "video/mp4" else "video/mp2t"
         var ext = if (fmp4) "mp4" else "ts"
+        var muxedBaseUs: Long? = null
+
+        // ---- 영상과 소리가 따로 받아졌으면 하나의 MP4 로 합침 (합치지 못하면 소리 없는 파일이 되므로 실패 처리)
+        if (hasAudio) {
+            val audioMerged = File(dir, if (afmp4) "audio.mp4" else "audio.ts")
+            mergeStream(audioMerged, if (afmp4) ainitFile else null, tasks.filter { it.name.startsWith("a") }.map { it.name })
+            val muxed = File(dir, "muxed.mp4")
+            val baseUs = Remuxer.mux(merged, audioMerged, muxed)
+            audioMerged.delete()
+            if (baseUs == null || muxed.length() == 0L) {
+                muxed.delete()
+                throw IOException("영상과 소리를 합치지 못했습니다 (지원하지 않는 오디오/영상 형식)")
+            }
+            merged.delete()
+            finalFile = muxed
+            mime = "video/mp4"
+            ext = "mp4"
+            muxedBaseUs = baseUs
+        }
 
         // ---- 사이트 자막 -> 영상에 합치기 (MP4 자막 트랙)
         var subInfo = ""
@@ -158,22 +201,28 @@ object Downloader {
             if (subs.isEmpty()) subInfo = "자막을 불러오지 못했습니다"
         }
         if (subs.isNotEmpty()) {
-            // 자막 트랙은 MP4 에만 넣을 수 있으므로 'MP4 변환' 설정과 무관하게 리먹싱
-            val mp4 = File(dir, "out.mp4")
-            val baseUs = Remuxer.remux(merged, mp4, strict = fmp4)
-            if (baseUs != null && mp4.length() > 0) {
-                baseMs = baseUs / 1000
-                merged.delete()
-                finalFile = mp4
-                mime = "video/mp4"
-                ext = "mp4"
-                embedded = Mp4Subtitles.embed(mp4, SubtitleFetcher.toTracks(subs, baseMs))
+            if (muxedBaseUs != null) {
+                // 이미 MP4(영상+소리)로 합쳐진 상태 -> 바로 자막 트랙 추가
+                baseMs = muxedBaseUs / 1000
+                embedded = Mp4Subtitles.embed(finalFile, SubtitleFetcher.toTracks(subs, baseMs))
             } else {
-                mp4.delete()
+                // 자막 트랙은 MP4 에만 넣을 수 있으므로 'MP4 변환' 설정과 무관하게 리먹싱
+                val mp4 = File(dir, "out.mp4")
+                val baseUs = Remuxer.remux(merged, mp4, strict = fmp4)
+                if (baseUs != null && mp4.length() > 0) {
+                    baseMs = baseUs / 1000
+                    merged.delete()
+                    finalFile = mp4
+                    mime = "video/mp4"
+                    ext = "mp4"
+                    embedded = Mp4Subtitles.embed(mp4, SubtitleFetcher.toTracks(subs, baseMs))
+                } else {
+                    mp4.delete()
+                }
             }
             val langs = subs.joinToString(", ") { it.lang.ifBlank { it.name } }
             subInfo = if (embedded) "자막 ${subs.size}개 합침 ($langs)" else "자막을 영상에 합치지 못해 .srt 로 따로 저장"
-        } else if (!fmp4 && Repo.convertMp4) {
+        } else if (!fmp4 && !hasAudio && Repo.convertMp4) {
             val mp4 = File(dir, "out.mp4")
             if (Remuxer.toMp4(merged, mp4) && mp4.length() > 0) {
                 merged.delete()
@@ -280,6 +329,9 @@ object Downloader {
     /** 일부 사이트는 TS 앞에 가짜 이미지 헤더를 붙임 -> 0x47 동기 바이트 위치부터 사용 */
     private fun stripFakeHeader(d: ByteArray): ByteArray {
         if (d.size < 564 || d[0] == 0x47.toByte()) return d
+        // ID3 태그 / ADTS(AAC) 로 시작하는 오디오 조각은 건드리지 않음
+        if (d[0] == 0x49.toByte() && d[1] == 0x44.toByte() && d[2] == 0x33.toByte()) return d
+        if (d[0] == 0xFF.toByte() && (d[1].toInt() and 0xF0) == 0xF0) return d
         val limit = minOf(d.size - 376, 8192)
         for (k in 1 until limit) {
             if (d[k] == 0x47.toByte() && d[k + 188] == 0x47.toByte() && d[k + 376] == 0x47.toByte()) {

@@ -128,6 +128,7 @@ object Detector {
             var resolution = ""
             var declaredSubs: List<SubTrack> = emptyList()
             val variantUrls = HashSet<String>()
+            var audio: M3u8.AudioRendition? = null
             var guard = 0
             while (M3u8.isMaster(text) && guard++ < 3) {
                 val variants = M3u8.parseMaster(text, url)
@@ -142,6 +143,12 @@ object Detector {
                 children.addAll(variants.map { it.url })
                 val best = variants.maxWith(compareBy<M3u8.Variant>({ it.bandwidth }, { it.height }))
                 resolution = best.label()
+                // 소리가 영상과 따로 있는 경우(별도 오디오 트랙) 같이 받을 수 있게 기록
+                M3u8.pickAudio(text, url, best)?.let {
+                    audio = it
+                    variantUrls.add(it.url)
+                    children.add(it.url)
+                }
                 url = best.url
                 text = Http.getText(url, item)
                 if (!text.trimStart().startsWith("#EXTM3U")) throw IOException("잘못된 재생목록 응답")
@@ -163,6 +170,21 @@ object Detector {
                 it.keyMethod != null && it.keyMethod != "NONE" && it.keyMethod != "AES-128"
             }
             if (unsupported != null) throw IOException("지원하지 않는 암호화(${unsupported.keyMethod})")
+
+            // 별도 오디오 재생목록 받아서 저장
+            var audioUrl = ""
+            audio?.let { a ->
+                val at = Http.getText(a.url, item)
+                if (!at.trimStart().startsWith("#EXTM3U")) throw IOException("잘못된 오디오 재생목록 응답")
+                val am = M3u8.parseMedia(at, a.url)
+                if (am.segments.isEmpty()) throw IOException("오디오 조각(segment)이 없습니다")
+                val badAudio = am.segments.firstOrNull {
+                    it.keyMethod != null && it.keyMethod != "NONE" && it.keyMethod != "AES-128"
+                }
+                if (badAudio != null) throw IOException("지원하지 않는 암호화(${badAudio.keyMethod})")
+                Repo.audioPlaylistFile(item.id).writeText(M3u8.rewriteAbsolute(at, a.url))
+                audioUrl = a.url
+            }
 
             // master 에서 파생된 하위(variant) 항목이 먼저 잡혀 있었다면 정리
             if (variantUrls.isNotEmpty()) {
@@ -189,6 +211,7 @@ object Detector {
                 it.copy(
                     subs = (declaredSubs + extra).distinctBy { s -> s.url },
                     mediaUrl = url,
+                    audioUrl = audioUrl,
                     resolution = resolution,
                     durationSec = media.duration,
                     segmentCount = media.segments.size,

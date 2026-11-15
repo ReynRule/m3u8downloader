@@ -86,13 +86,23 @@ object Repo {
             _items.value = _items.value.filter { it.id !in set }
             save()
         }
-        set.forEach { playlistFile(it).delete() }
+        set.forEach {
+            playlistFile(it).delete()
+            audioPlaylistFile(it).delete()
+        }
     }
 
     fun playlistFile(id: String): File {
         val dir = File(appContext.filesDir, "playlists")
         dir.mkdirs()
         return File(dir, "$id.m3u8")
+    }
+
+    /** 영상과 소리가 따로 있는 HLS 의 오디오 재생목록 */
+    fun audioPlaylistFile(id: String): File {
+        val dir = File(appContext.filesDir, "playlists")
+        dir.mkdirs()
+        return File(dir, "$id.audio.m3u8")
     }
 
     private fun save() {
@@ -114,6 +124,7 @@ object Repo {
         put("pageUrl", v.pageUrl)
         put("sourceUrl", v.sourceUrl)
         put("mediaUrl", v.mediaUrl)
+        put("audioUrl", v.audioUrl)
         put("userAgent", v.userAgent)
         put("cookie", v.cookie)
         put("referer", v.referer)
@@ -145,6 +156,7 @@ object Repo {
         pageUrl = o.optString("pageUrl"),
         sourceUrl = o.optString("sourceUrl"),
         mediaUrl = o.optString("mediaUrl"),
+        audioUrl = o.optString("audioUrl"),
         userAgent = o.optString("userAgent"),
         cookie = o.optString("cookie"),
         referer = o.optString("referer"),
