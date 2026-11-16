@@ -12,9 +12,12 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -27,11 +30,16 @@ import javax.crypto.spec.SecretKeySpec
  * 병렬 세그먼트 다운로드 -> (AES-128 복호화) -> 순서대로 병합 -> (선택) MP4 변환 -> 갤러리(Movies) 저장
  */
 object Downloader {
-    // 동시 다운로드 조각 수: START 에서 시작해 성공이 이어지면 MAX 까지 늘리고,
-    // 서버가 제한(429/5xx/연결 끊김)을 걸면 MIN 까지 줄인다 (적응형).
-    private const val MIN_THREADS = 4
-    private const val START_THREADS = 8
-    private const val MAX_THREADS = 12
+    // 동시 다운로드 조각 수: START 에서 시작해 성공이 이어지면 빠르게 MAX 까지 늘리고,
+    // 서버가 제한(429/5xx/연결 끊김/타임아웃)을 걸면 4분의 3 으로 줄인다 (적응형, 최소 MIN).
+    // 영상 2개가 동시에 받아져도 IO 스레드(64)를 넘지 않도록 MAX 는 32.
+    private const val MIN_THREADS = 6
+    private const val START_THREADS = 16
+    private const val MAX_THREADS = 32
+    private const val RAMP_EVERY = 6 // 연속 성공 N 개마다 동시성 +2
+
+    /** 목표: 영상 길이와 상관없이 전체 다운로드를 이 시간 안에 (네트워크가 받쳐줄 때). 로그에 초과 예상을 남긴다 */
+    private const val TARGET_SEC = 600
 
     suspend fun run(ctx: Context, itemId: String) {
         withContext(Dispatchers.IO) { doRun(ctx, itemId) }
@@ -80,15 +88,15 @@ object Downloader {
         val limit = AtomicInteger(START_THREADS)
         val okStreak = AtomicInteger(0)
         val onOk: () -> Unit = {
-            if (okStreak.incrementAndGet() >= 15) {
+            if (okStreak.incrementAndGet() >= RAMP_EVERY) {
                 okStreak.set(0)
-                limit.updateAndGet { minOf(MAX_THREADS, it + 1) }
+                limit.updateAndGet { minOf(MAX_THREADS, it + 2) }
             }
         }
         val onThrottle: (Exception) -> Unit = {
             okStreak.set(0)
-            val prev = limit.getAndUpdate { maxOf(MIN_THREADS, it - 2) }
-            if (prev > MIN_THREADS) Dbg.i("DL", "서버 제한(${it.message}) -> 동시 ${maxOf(MIN_THREADS, prev - 2)}개로 감속")
+            val prev = limit.getAndUpdate { maxOf(MIN_THREADS, it * 3 / 4) }
+            if (prev > MIN_THREADS) Dbg.i("DL", "서버 제한(${it.message}) -> 동시 ${maxOf(MIN_THREADS, prev * 3 / 4)}개로 감속")
         }
 
         val keyCache = ConcurrentHashMap<String, ByteArray>()
@@ -98,6 +106,9 @@ object Downloader {
             keyCache[uri] = k
             return k
         }
+
+        // 이전 시도에서 끊겨 남은 임시 파일 정리
+        dir.listFiles()?.filter { it.extension == "dl" || it.extension == "dec" || it.extension == "tmp" }?.forEach { it.delete() }
 
         // fMP4 초기화 세그먼트 (영상 / 오디오)
         val initFile = File(dir, "init.bin")
@@ -117,74 +128,139 @@ object Downloader {
             report(done.incrementAndGet())
         }
 
-        // 영상 + 오디오 조각을 하나의 작업 목록으로 합쳐 같은 워커 풀에서 병렬 처리
-        class Task(val seg: M3u8.Segment, val name: String, val stripHeader: Boolean)
-        val tasks = ArrayList<Task>(segs.size + asegs.size)
-        segs.forEachIndexed { i, s -> tasks.add(Task(s, "%06d.seg".format(i), !fmp4)) }
-        asegs.forEachIndexed { i, s -> tasks.add(Task(s, "a%06d.seg".format(i), !afmp4)) }
+        // 영상 + 오디오 조각을 하나의 작업 목록으로 합쳐 같은 워커 풀에서 병렬 처리.
+        // 영상/오디오를 번갈아 배치해서 한쪽이 몰려 늦어지는 일 없이 같은 속도로 진행되게 한다.
+        class Task(val seg: M3u8.Segment, val name: String, val stripHeader: Boolean, val audio: Boolean)
+        val vt = segs.mapIndexed { i, s -> Task(s, "%06d.seg".format(i), !fmp4, false) }
+        val at = asegs.mapIndexed { i, s -> Task(s, "a%06d.seg".format(i), !afmp4, true) }
+        val tasks = ArrayList<Task>(vt.size + at.size)
+        var vi = 0
+        var ai = 0
+        while (vi < vt.size || ai < at.size) {
+            // 진행 비율이 더 낮은 쪽을 먼저
+            val takeVideo = ai >= at.size || (vi < vt.size && vi.toLong() * at.size <= ai.toLong() * vt.size)
+            if (takeVideo) tasks.add(vt[vi++]) else tasks.add(at[ai++])
+        }
 
         // 암호화 키는 미리 한 번씩만 받아 둠 (워커들이 동시에 같은 키를 중복 요청하지 않도록)
         tasks.mapNotNull { if (it.seg.keyMethod == "AES-128") it.seg.keyUri else null }
             .distinct().forEach { keyFor(it) }
 
+        // 조각 하나: 파일로 스트리밍 저장 -> (복호화) -> (앞부분 ID3/가짜 헤더 제거) -> 완성 파일로 이름 변경.
+        // 조각을 통째로 메모리에 올리지 않으므로 동시 연결을 많이 늘려도 메모리 부족이 없다.
+        val netBytes = AtomicLong(0)
+        suspend fun fetchSegment(t: Task) {
+            val s = t.seg
+            val base = t.name.removeSuffix(".seg")
+            val raw = File(dir, "$base.dl")
+            fetchToFile(s.url, item, s.rangeStart, s.rangeLen, raw, onThrottle) { netBytes.addAndGet(it.toLong()) }
+            var cur = raw
+            if (s.keyMethod == "AES-128" && s.keyUri != null) {
+                val dec = File(dir, "$base.dec")
+                decryptFile(cur, dec, keyFor(s.keyUri), ivFor(s))
+                cur.delete()
+                cur = dec
+            }
+            var skip = 0
+            if (t.stripHeader) {
+                val head = readHead(cur)
+                skip = StreamUtil.headSkip(head, cur.length())
+                // 패킹 오디오의 시작 PTS(ID3)는 영상과 싱크를 맞출 때 쓰므로 첫 조각 것을 기록해 둔다
+                if (t.name == "a000000.seg") {
+                    StreamUtil.id3Pts90k(head)?.let { File(dir, "ats.txt").writeText(it.toString()) }
+                }
+                // 첫 조각은 포맷 확인용으로 앞 바이트 기록 (47=TS, ff f1=ADTS AAC, 49 44 33=ID3)
+                if (t.name == "000000.seg" || t.name == "a000000.seg") {
+                    Dbg.i("DL", "${t.name} ${cur.length()}B 앞 [${Dbg.hex(head)}] -> 앞 ${skip}B 제거 ats=${StreamUtil.id3Pts90k(head)}")
+                }
+            }
+            val out = File(dir, t.name)
+            if (skip > 0) {
+                val tmp = File(dir, "$base.tmp")
+                copyFrom(cur, skip.toLong(), tmp)
+                cur.delete()
+                if (!tmp.renameTo(out)) throw IOException("파일 저장 실패")
+            } else if (!cur.renameTo(out)) {
+                throw IOException("파일 저장 실패")
+            }
+        }
+
         // 병렬 다운로드 (이미 받은 조각은 건너뜀 -> 이어받기)
         val skipped = tasks.count { File(dir, it.name).let { f -> f.exists() && f.length() > 0 } }
         if (skipped > 0) Dbg.i("DL", "이어받기: 이미 받은 조각 $skipped/${tasks.size}개 건너뜀")
         val next = AtomicInteger(0)
+        val fetched = AtomicInteger(0)
+        val tDl = SystemClock.elapsedRealtime()
         coroutineScope {
-            repeat(MAX_THREADS) { w ->
-                launch {
-                    while (true) {
-                        ensureActive()
-                        // 현재 허용 동시성보다 번호가 큰 워커는 대기 (서버 제한 시 자동 감속)
-                        if (w >= limit.get()) {
-                            if (next.get() >= tasks.size) break
-                            delay(200)
-                            continue
-                        }
-                        val i = next.getAndIncrement()
-                        if (i >= tasks.size) break
-                        val t = tasks[i]
-                        val out = File(dir, t.name)
-                        if (!(out.exists() && out.length() > 0)) {
-                            val s = t.seg
-                            var data = fetchBytes(s.url, item, s.rangeStart, s.rangeLen, onThrottle)
-                            if (s.keyMethod == "AES-128" && s.keyUri != null) {
-                                data = decrypt(data, keyFor(s.keyUri), ivFor(s))
-                            }
-                            val raw = data
-                            if (t.stripHeader) data = stripFakeHeader(stripId3(data))
-                            // 첫 조각은 포맷 확인용으로 앞 바이트 기록 (47=TS, ff f1=ADTS AAC, 49 44 33=ID3)
-                            if (t.name == "000000.seg" || t.name == "a000000.seg") {
-                                Dbg.i("DL", "${t.name} ${raw.size}B 원본 [${Dbg.hex(raw)}] -> 정리 후 ${data.size}B [${Dbg.hex(data)}]")
-                            }
-                            val tmp = File(dir, t.name.removeSuffix(".seg") + ".tmp")
-                            tmp.writeBytes(data)
-                            if (!tmp.renameTo(out)) throw IOException("파일 저장 실패")
-                            onOk()
-                        }
-                        report(done.incrementAndGet())
+            // 10초마다 속도/예상 시간을 로그에 남긴다 (10분 목표 확인용)
+            val reporter = launch {
+                while (isActive) {
+                    delay(10_000)
+                    val el = (SystemClock.elapsedRealtime() - tDl) / 1000.0
+                    val f = fetched.get()
+                    val todo = tasks.size - skipped
+                    if (f > 0 && el > 0) {
+                        val eta = el * (todo - f) / f
+                        val mb = netBytes.get() / 1048576.0
+                        Dbg.i("DL", "속도 %.1fMB/s 동시 %d 받음 %d/%d 예상 남은 %ds (총 약 %ds)%s".format(
+                            mb / el, limit.get(), f, todo, eta.toInt(), (el + eta).toInt(),
+                            if (el + eta > TARGET_SEC) " ⚠ ${TARGET_SEC / 60}분 초과 예상(네트워크/서버 속도 한계)" else ""
+                        ))
                     }
                 }
             }
+            coroutineScope {
+                repeat(MAX_THREADS) { w ->
+                    launch {
+                        while (true) {
+                            ensureActive()
+                            // 현재 허용 동시성보다 번호가 큰 워커는 대기 (서버 제한 시 자동 감속)
+                            if (w >= limit.get()) {
+                                if (next.get() >= tasks.size) break
+                                delay(100)
+                                continue
+                            }
+                            val i = next.getAndIncrement()
+                            if (i >= tasks.size) break
+                            val t = tasks[i]
+                            val out = File(dir, t.name)
+                            if (!(out.exists() && out.length() > 0)) {
+                                fetchSegment(t)
+                                fetched.incrementAndGet()
+                                onOk()
+                            }
+                            report(done.incrementAndGet())
+                        }
+                    }
+                }
+            }
+            reporter.cancel()
         }
 
         // 병합
-        Dbg.i("DL", "조각 다운로드 완료 ${(SystemClock.elapsedRealtime() - t0) / 1000}s, 최종 동시성 ${limit.get()}")
+        Dbg.i("DL", "조각 다운로드 완료 ${(SystemClock.elapsedRealtime() - t0) / 1000}s, 최종 동시성 ${limit.get()}, 받은 용량 ${netBytes.get() / 1048576}MB")
         Repo.update(itemId) { it.copy(status = Status.MERGING, progress = 100) }
+        // FileChannel.transferTo 로 복사 (유저 공간 버퍼를 거치지 않아 빠름). 조각은 합치는 즉시 지워 디스크를 아낀다.
         suspend fun mergeStream(dst: File, init: File?, names: List<String>) {
-            dst.outputStream().buffered(1 shl 16).use { os ->
-                if (init != null) os.write(init.readBytes())
+            FileOutputStream(dst).channel.use { out ->
+                if (init != null) {
+                    FileInputStream(init).channel.use { ic -> copyChannel(ic, out) }
+                }
                 for (n in names) {
                     currentCoroutineContext().ensureActive()
                     val f = File(dir, n)
-                    f.inputStream().use { it.copyTo(os) }
+                    FileInputStream(f).channel.use { ic -> copyChannel(ic, out) }
                     f.delete()
                 }
             }
         }
         val merged = File(dir, if (fmp4) "merged.mp4" else "merged.ts")
-        mergeStream(merged, if (fmp4) initFile else null, tasks.filter { !it.name.startsWith("a") }.map { it.name })
+        val audioMerged = File(dir, if (afmp4) "audio.mp4" else "audio.ts")
+        // 영상/오디오 병합은 서로 독립이라 동시에 수행
+        coroutineScope {
+            launch { mergeStream(merged, if (fmp4) initFile else null, tasks.filter { !it.audio }.map { it.name }) }
+            if (hasAudio) launch { mergeStream(audioMerged, if (afmp4) ainitFile else null, tasks.filter { it.audio }.map { it.name }) }
+        }
         Dbg.i("DL", "영상 병합 " + Remuxer.describe(merged))
 
         var finalFile = merged
@@ -194,12 +270,14 @@ object Downloader {
 
         // ---- 영상과 소리가 따로 받아졌으면 하나의 MP4 로 합침 (합치지 못하면 소리 없는 파일이 되므로 실패 처리)
         if (hasAudio) {
-            val audioMerged = File(dir, if (afmp4) "audio.mp4" else "audio.ts")
-            mergeStream(audioMerged, if (afmp4) ainitFile else null, tasks.filter { it.name.startsWith("a") }.map { it.name })
             Dbg.i("DL", "오디오 병합 " + Remuxer.describe(audioMerged))
+            // 패킹 오디오(ADTS)면 ID3 에 적힌 시작 PTS 만큼 오디오를 뒤로 밀어 영상과 싱크를 맞춘다
+            val atsFile = File(dir, "ats.txt")
+            val audioOffsetUs = if (!afmp4 && atsFile.exists())
+                (atsFile.readText().trim().toLongOrNull() ?: 0L) * 1_000_000L / 90_000L else 0L
             val muxed = File(dir, "muxed.mp4")
-            val baseUs = Remuxer.mux(merged, audioMerged, muxed)
-            Dbg.i("DL", "영상+오디오 합치기 결과 baseUs=$baseUs size=${muxed.length()}")
+            val baseUs = Remuxer.mux(merged, audioMerged, muxed, audioOffsetUs)
+            Dbg.i("DL", "영상+오디오 합치기 결과 baseUs=$baseUs size=${muxed.length()} 오디오 시작보정=${audioOffsetUs}us")
             audioMerged.delete()
             if (baseUs == null || muxed.length() == 0L) {
                 muxed.delete()
@@ -263,7 +341,11 @@ object Downloader {
         val name = "$base.$ext"
         // 최종 파일에 소리 트랙이 실제로 있는지 확인 (소리 안 남 진단용)
         Dbg.i("DL", "최종 " + Remuxer.describe(finalFile))
-        if (!Remuxer.hasAudio(finalFile)) Dbg.e("DL", "최종 파일에 오디오 트랙 없음! (소리 안 나는 원인)")
+        if (!Remuxer.hasAudio(finalFile)) {
+            Dbg.e("DL", "최종 파일에 오디오 트랙 없음! (소리 안 나는 원인)")
+            val warn = "⚠ 소리 트랙이 없습니다 (이 페이지에서 오디오 m3u8 을 찾지 못함). 브라우저에서 영상을 재생해 소리가 나오는 상태로 다시 감지해 보세요"
+            subInfo = if (subInfo.isBlank()) warn else "$subInfo\n$warn"
+        }
         val uri = saveToMediaStore(ctx, finalFile, name, mime)
         Dbg.i("DL", "저장 완료 $name ($mime) -> $uri, 총 ${(SystemClock.elapsedRealtime() - t0) / 1000}s")
         dir.deleteRecursively()
@@ -290,34 +372,27 @@ object Downloader {
     /** 브라우저 헤더(Origin/Sec-Fetch)를 거부하고 최소 헤더에만 응답하는 호스트 */
     private val lightHosts: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
-    internal suspend fun fetchBytes(
-        url: String, item: VideoItem, start: Long, len: Long,
-        onThrottle: ((Exception) -> Unit)? = null
-    ): ByteArray {
+    /**
+     * 재시도 공통 로직. [block] 은 한 번 시도하는 동작(blocking)이며 실패하면 예외를 던진다.
+     * 브라우저 헤더와 최소 헤더를 번갈아 시도하고, 최소 헤더로만 되는 호스트는 기억해서 이후 조각은 처음부터
+     * 최소 헤더로 받는다 (안 그러면 조각마다 500 을 여러 번 맞고 백오프하느라 수십 배 느려짐).
+     */
+    private suspend fun <T> withRetry(
+        url: String, item: VideoItem, onThrottle: ((Exception) -> Unit)?, block: (light: Boolean) -> T
+    ): T {
         var last: Exception? = null
         val max = 7
         val host = Http.hostOf(url)
         for (attempt in 0 until max) {
             currentCoroutineContext().ensureActive()
-            // 브라우저 헤더와 최소 헤더를 번갈아 시도. 최소 헤더로만 되는 호스트는 기억해서
-            // 이후 조각은 처음부터 최소 헤더로 받는다 (안 그러면 조각마다 500 을 여러 번 맞고
-            // 백오프하느라 다운로드가 수십 배 느려짐)
             val preferLight = host in lightHosts
             val light = (attempt % 2 == 1) != preferLight
             try {
-                val rb = Http.request(url, item, light = light)
-                if (len > 0) rb.header("Range", "bytes=$start-${start + len - 1}")
-                Http.client.newCall(rb.build()).execute().use { r ->
-                    if (!r.isSuccessful) {
-                        val ra = (r.header("Retry-After")?.trim()?.toLongOrNull() ?: 0L) * 1000L
-                        throw HttpErr(r.code, ra)
-                    }
-                    val bytes = r.body!!.bytes()
-                    if (light && !preferLight && last is HttpErr && lightHosts.add(host)) {
-                        Dbg.i("HTTP", "$host: 최소 헤더로만 응답 -> 이후 최소 헤더 사용")
-                    }
-                    return bytes
+                val r = block(light)
+                if (light && !preferLight && last is HttpErr && lightHosts.add(host)) {
+                    Dbg.i("HTTP", "$host: 최소 헤더로만 응답 -> 이후 최소 헤더 사용")
                 }
+                return r
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -328,7 +403,7 @@ object Downloader {
                 // 영구 오류(없음/권한/잘못된 요청)는 오래 재시도하지 않음
                 if (e is HttpErr && (e.code == 404 || e.code == 410 || e.code == 400) && attempt >= 1) break
                 if (attempt == max - 1) break
-                val backoff = minOf(8000L, 700L * (1L shl attempt)) + (0..400).random()
+                val backoff = minOf(5000L, 500L * (1L shl attempt)) + (0..300).random()
                 val wait = if (e is HttpErr) maxOf(backoff, minOf(e.retryAfterMs, 15000L)) else backoff
                 Dbg.i("HTTP", "재시도 ${attempt + 1}/$max ${e.message} light=$light ${wait}ms 후 | ${url.substringAfterLast('/').take(80)}")
                 delay(wait)
@@ -338,14 +413,131 @@ object Downloader {
         throw IOException("다운로드 실패: ${last?.message ?: "알 수 없는 오류"} (${Http.hostOf(url)})")
     }
 
-    private fun decrypt(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
+    private fun checked(r: okhttp3.Response): okhttp3.Response {
+        if (!r.isSuccessful) {
+            val ra = (r.header("Retry-After")?.trim()?.toLongOrNull() ?: 0L) * 1000L
+            throw HttpErr(r.code, ra)
+        }
+        return r
+    }
+
+    /** [maxBytes] > 0 이면 그만큼만 읽고 연결을 닫는다 (포맷 확인용 부분 읽기) */
+    internal suspend fun fetchBytes(
+        url: String, item: VideoItem, start: Long, len: Long,
+        onThrottle: ((Exception) -> Unit)? = null, maxBytes: Int = -1
+    ): ByteArray = withRetry(url, item, onThrottle) { light ->
+        val rb = Http.request(url, item, light = light)
+        if (len > 0) rb.header("Range", "bytes=$start-${start + len - 1}")
+        Http.dl.newCall(rb.build()).execute().use { r0 ->
+            val body = checked(r0).body!!
+            if (maxBytes <= 0) {
+                body.bytes()
+            } else {
+                val bo = java.io.ByteArrayOutputStream(minOf(maxBytes, 1 shl 20))
+                val buf = ByteArray(1 shl 16)
+                body.byteStream().use { ins ->
+                    while (bo.size() < maxBytes) {
+                        val n = ins.read(buf, 0, minOf(buf.size, maxBytes - bo.size()))
+                        if (n < 0) break
+                        bo.write(buf, 0, n)
+                    }
+                }
+                bo.toByteArray()
+            }
+        }
+    }
+
+    /** 조각 하나를 [dst] 파일로 스트리밍 저장 (메모리에 통째로 올리지 않음). 중간에 끊기면 예외 -> 재시도 */
+    internal suspend fun fetchToFile(
+        url: String, item: VideoItem, start: Long, len: Long, dst: File,
+        onThrottle: ((Exception) -> Unit)? = null, onBytes: ((Int) -> Unit)? = null
+    ) {
+        withRetry(url, item, onThrottle) { light ->
+            val rb = Http.request(url, item, light = light)
+            if (len > 0) rb.header("Range", "bytes=$start-${start + len - 1}")
+            Http.dl.newCall(rb.build()).execute().use { r0 ->
+                val body = checked(r0).body!!
+                val expected = body.contentLength()
+                var written = 0L
+                val buf = ByteArray(1 shl 16)
+                body.byteStream().use { ins ->
+                    FileOutputStream(dst).use { os ->
+                        while (true) {
+                            val n = ins.read(buf)
+                            if (n < 0) break
+                            os.write(buf, 0, n)
+                            written += n
+                            onBytes?.invoke(n)
+                        }
+                    }
+                }
+                if (expected >= 0 && written != expected) throw IOException("조각이 중간에 끊김 ($written/$expected)")
+            }
+        }
+    }
+
+    private fun readHead(f: File): ByteArray =
+        FileInputStream(f).use { ins ->
+            val buf = ByteArray(StreamUtil.HEAD_BYTES)
+            var n = 0
+            while (n < buf.size) {
+                val r = ins.read(buf, n, buf.size - n)
+                if (r < 0) break
+                n += r
+            }
+            if (n == buf.size) buf else buf.copyOf(n)
+        }
+
+    /** [src] 의 [from] 바이트 위치부터 끝까지를 [dst] 로 복사 */
+    private fun copyFrom(src: File, from: Long, dst: File) {
+        FileInputStream(src).channel.use { ic ->
+            FileOutputStream(dst).channel.use { oc ->
+                ic.position(from)
+                copyChannel(ic, oc)
+            }
+        }
+    }
+
+    private fun copyChannel(ic: java.nio.channels.FileChannel, oc: java.nio.channels.FileChannel) {
+        var pos = ic.position()
+        val size = ic.size()
+        while (pos < size) {
+            val n = ic.transferTo(pos, minOf(size - pos, 8L shl 20), oc)
+            if (n <= 0) break
+            pos += n
+        }
+    }
+
+    /** AES-128-CBC 복호화 (파일 -> 파일 스트리밍). 길이가 틀리거나 패딩이 깨지면 예외 */
+    private fun decryptFile(src: File, dst: File, key: ByteArray, iv: ByteArray) {
         if (key.size != 16) throw IOException("잘못된 암호화 키(길이 ${key.size})")
         val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        FileInputStream(src).use { ins ->
+            FileOutputStream(dst).buffered(1 shl 16).use { os ->
+                val buf = ByteArray(1 shl 16)
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    c.update(buf, 0, n)?.let { os.write(it) }
+                }
+                os.write(c.doFinal())
+            }
+        }
+    }
+
+    /**
+     * 메모리 상 데이터 복호화 (분석 단계의 첫 조각 확인용). 앞부분만 받은 데이터라 마지막 패딩이 없으므로
+     * 패딩 검사 없이(NoPadding) 푼다. 16바이트 배수 길이여야 한다.
+     */
+    internal fun decryptPartial(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
+        if (key.size != 16) throw IOException("잘못된 암호화 키(길이 ${key.size})")
+        val c = Cipher.getInstance("AES/CBC/NoPadding")
         c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
         return c.doFinal(data)
     }
 
-    private fun ivFor(s: M3u8.Segment): ByteArray {
+    internal fun ivFor(s: M3u8.Segment): ByteArray {
         val iv = ByteArray(16)
         val hex = s.iv
         if (hex != null) {
@@ -364,43 +556,10 @@ object Downloader {
         return iv
     }
 
-    private fun decodeDataUri(uri: String): ByteArray {
+    internal fun decodeDataUri(uri: String): ByteArray {
         val payload = uri.substringAfter("base64,", "")
         if (payload.isEmpty()) throw IOException("지원하지 않는 키 형식")
         return Base64.decode(payload, Base64.DEFAULT)
-    }
-
-    /**
-     * 패킹된 오디오(.aac 조각) 앞의 ID3 태그(타임스탬프 정보)를 제거.
-     * 남겨 두면 조각을 이어 붙인 파일에서 두 번째 조각의 ID3 를 만나는 순간 오디오 읽기가 끝나
-     * 첫 조각(수 초) 뒤로 소리가 사라진다.
-     * ID3 의 시작 시각(PRIV transportStreamTimestamp)은 쓰지 않으므로 영상과 소리의 시작 차이만큼
-     * (보통 수십 ms) 어긋날 수 있다. 더 정확히 맞춰야 하면 그 값으로 오디오 시간을 보정할 것.
-     */
-    private fun stripId3(d: ByteArray): ByteArray {
-        var p = 0
-        while (d.size - p >= 10 && d[p] == 0x49.toByte() && d[p + 1] == 0x44.toByte() && d[p + 2] == 0x33.toByte()) {
-            val size = (d[p + 6].toInt() and 0x7f shl 21) or (d[p + 7].toInt() and 0x7f shl 14) or
-                (d[p + 8].toInt() and 0x7f shl 7) or (d[p + 9].toInt() and 0x7f)
-            val footer = if (d[p + 5].toInt() and 0x10 != 0) 10 else 0
-            p += 10 + size + footer
-        }
-        return if (p == 0) d else d.copyOfRange(minOf(p, d.size), d.size)
-    }
-
-    /** 일부 사이트는 TS 앞에 가짜 이미지 헤더를 붙임 -> 0x47 동기 바이트 위치부터 사용 */
-    private fun stripFakeHeader(d: ByteArray): ByteArray {
-        if (d.size < 564 || d[0] == 0x47.toByte()) return d
-        // ID3 태그 / ADTS(AAC) 로 시작하는 오디오 조각은 건드리지 않음
-        if (d[0] == 0x49.toByte() && d[1] == 0x44.toByte() && d[2] == 0x33.toByte()) return d
-        if (d[0] == 0xFF.toByte() && (d[1].toInt() and 0xF0) == 0xF0) return d
-        val limit = minOf(d.size - 376, 8192)
-        for (k in 1 until limit) {
-            if (d[k] == 0x47.toByte() && d[k + 188] == 0x47.toByte() && d[k + 376] == 0x47.toByte()) {
-                return d.copyOfRange(k, d.size)
-            }
-        }
-        return d
     }
 
     private fun sanitize(s: String): String {

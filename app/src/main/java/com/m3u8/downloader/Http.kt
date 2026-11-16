@@ -15,7 +15,19 @@ object Http {
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
-        .connectionPool(okhttp3.ConnectionPool(32, 5, TimeUnit.MINUTES))
+        .connectionPool(okhttp3.ConnectionPool(96, 5, TimeUnit.MINUTES))
+        .build()
+
+    /**
+     * 영상 조각 전용 클라이언트 (연결 풀/디스패처는 [client] 와 공유).
+     * - HTTP/1.1 만 사용: HTTP/2 는 한 호스트에 연결 1개로 몰려서 서버가 연결당 속도를 제한하면 병렬 다운로드가
+     *   전혀 빨라지지 않는다. 1.1 이면 조각마다 별도 TCP 연결이라 병렬 수만큼 속도가 오른다.
+     * - 읽기 타임아웃을 짧게: 멈춘 연결을 오래 붙잡고 있지 않고 빨리 재시도
+     */
+    val dl: OkHttpClient = client.newBuilder()
+        .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
     fun hostOf(u: String): String = u.toHttpUrlOrNull()?.host ?: ""

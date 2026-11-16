@@ -20,7 +20,8 @@ object Remuxer {
     fun remux(src: File, dst: File, strict: Boolean = false): Long? = process(listOf(src), dst)
 
     /** 영상 파일 + 별도 오디오 파일을 하나의 MP4 로 합친다 (타임스탬프 기준을 공유해 싱크 유지) */
-    fun mux(video: File, audio: File, dst: File): Long? = process(listOf(video, audio), dst)
+    fun mux(video: File, audio: File, dst: File, audioOffsetUs: Long = 0L): Long? =
+        process(listOf(video, audio), dst, longArrayOf(0L, audioOffsetUs))
 
     /** 파일의 트랙 목록 (로그용): mime / 샘플레이트·채널 / 해상도 / 길이 */
     fun describe(f: File): String {
@@ -60,7 +61,7 @@ object Remuxer {
     }
 
     /** 성공하면 입력들의 첫 샘플 중 가장 이른 시간(마이크로초) = 출력에서 0 이 되는 기준 시간 */
-    private fun process(srcs: List<File>, dst: File): Long? {
+    private fun process(srcs: List<File>, dst: File, offsets: LongArray = LongArray(srcs.size)): Long? {
         Dbg.i("Remux", "시작 ${srcs.joinToString(" + ") { "${it.name}(${it.length()}B)" }} -> ${dst.name}")
         val exs = ArrayList<MediaExtractor>()
         var mux: MediaMuxer? = null
@@ -97,13 +98,24 @@ object Remuxer {
             maps.forEachIndexed { k, mp -> if (mp.isEmpty()) Dbg.e("Remux", "${srcs[k].name}: 쓸 트랙 없음") }
 
             val firstAll = exs.map { it.sampleTime }
-            val firsts = firstAll.filter { it >= 0 }
-            if (firsts.isEmpty()) {
+            if (firstAll.none { it >= 0 }) {
                 Dbg.e("Remux", "첫 샘플 없음 -> 실패")
                 return null
             }
+            // 패킹된 오디오(ADTS)는 시간이 0 부터 시작하므로, ID3 에 적힌 시작 PTS([offsets])만큼 밀어야 영상과 맞는다.
+            // 다만 확장자/추출기에 따라 이미 시간이 맞춰진 경우도 있어서, 더하는 쪽이 영상 시작에 더 가까울 때만 적용한다.
+            val eff = LongArray(srcs.size)
+            for (j in srcs.indices) {
+                val o = offsets.getOrElse(j) { 0L }
+                val f = firstAll[j]
+                if (o == 0L || f < 0) continue
+                val ref = firstAll.filterIndexed { i, t -> i != j && t >= 0 }.minOrNull()
+                eff[j] = if (ref == null || Math.abs(f + o - ref) <= Math.abs(f - ref)) o else 0L
+                Dbg.i("Remux", "${srcs[j].name} 시작 보정 후보 ${o}us 첫샘플 ${f}us 기준 ${ref}us -> ${if (eff[j] != 0L) "적용" else "미적용"}")
+            }
+            val firsts = firstAll.mapIndexedNotNull { j, t -> if (t >= 0) t + eff[j] else null }
             val base = firsts.minOrNull() ?: return null
-            Dbg.i("Remux", "첫 샘플 시간(us) ${firstAll.joinToString()} base=$base")
+            Dbg.i("Remux", "첫 샘플 시간(us) ${firstAll.joinToString()} 보정 ${eff.joinToString()} base=$base")
             val counts = HashMap<Int, Int>()
 
             m.start()
@@ -114,7 +126,8 @@ object Remuxer {
                 var k = -1
                 var kt = Long.MAX_VALUE
                 for (j in exs.indices) {
-                    val t = exs[j].sampleTime
+                    val raw = exs[j].sampleTime
+                    val t = if (raw >= 0) raw + eff[j] else -1L
                     if (t in 0 until kt) {
                         kt = t
                         k = j

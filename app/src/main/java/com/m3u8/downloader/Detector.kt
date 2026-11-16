@@ -117,7 +117,56 @@ object Detector {
         scope.launch { analyze(item) }
     }
 
-    private fun analyze(item: VideoItem) {
+
+    private val pairLock = Any()
+
+    /**
+     * 사이트가 영상 재생목록과 오디오 재생목록을 따로 불러오는 경우(master 없이 각각 요청),
+     * 감지된 항목이 영상 따로/소리 따로 두 개로 나뉘어 영상만 받으면 무음이 된다.
+     * 같은 페이지에서 감지된 "소리 없는 영상" 과 "오디오 전용" 재생목록을 길이가 비슷한 것끼리 묶는다.
+     */
+    private fun tryPair(newId: String) {
+      synchronized(pairLock) {
+        val me = Repo.get(newId) ?: return@synchronized
+        if (me.status != Status.READY) return@synchronized
+        val all = Repo.items.value
+        fun pairable(o: VideoItem) =
+            o.id != me.id && o.pageUrl == me.pageUrl && (o.status == Status.READY || o.status == Status.FAILED)
+        if (me.audioOnly) {
+            val v = StreamUtil.closestByDuration(
+                me.durationSec,
+                all.filter { pairable(it) && !it.audioOnly && it.noAudio && it.audioUrl.isBlank() && it.mediaUrl.isNotBlank() }
+            ) { it.durationSec } ?: return@synchronized
+            attachAudio(v, me)
+        } else if (me.noAudio && me.audioUrl.isBlank()) {
+            val a = StreamUtil.closestByDuration(
+                me.durationSec,
+                all.filter { pairable(it) && it.audioOnly && it.status == Status.READY }
+            ) { it.durationSec } ?: return@synchronized
+            attachAudio(me, a)
+        }
+      }
+    }
+
+    private fun attachAudio(video: VideoItem, audio: VideoItem) {
+        try {
+            val src = Repo.playlistFile(audio.id)
+            if (!src.exists()) return
+            src.copyTo(Repo.audioPlaylistFile(video.id), overwrite = true)
+        } catch (e: Exception) {
+            Dbg.e("Detect", "오디오 재생목록 복사 실패", e)
+            return
+        }
+        Dbg.i("Detect", "영상+오디오 짝 맞춤: '${video.title}' ${video.mediaUrl} + 오디오 ${audio.mediaUrl} (${video.durationSec.toInt()}s/${audio.durationSec.toInt()}s)")
+        children.add(audio.sourceUrl)
+        children.add(audio.mediaUrl)
+        Repo.update(video.id) {
+            it.copy(audioUrl = audio.mediaUrl, noAudio = false, status = Status.READY, error = "", progress = 0)
+        }
+        Repo.remove(listOf(audio.id))
+    }
+
+    private suspend fun analyze(item: VideoItem) {
         try {
             var url = item.sourceUrl
             var text = Http.getText(url, item)
@@ -151,16 +200,26 @@ object Detector {
                 children.addAll(variants.map { it.url })
                 // 같은 화질이 AAC / AC-3·E-AC-3 소리로 나뉘어 있으면 AAC 쪽을 고른다
                 // (AC-3 계열은 MP4 로 합칠 수 없어 실패하거나 소리 없는 파일이 됨)
-                val best = variants.maxWith(compareBy<M3u8.Variant>({ it.aacAudio }, { it.bandwidth }, { it.height }))
+                val videoVariants = variants.filter { !it.audioOnly }.ifEmpty { variants }
+                val best = videoVariants.maxWith(compareBy<M3u8.Variant>({ it.aacAudio }, { it.bandwidth }, { it.height }))
                 resolution = best.label()
                 Dbg.i("Detect", "선택 variant ${best.label()} bw=${best.bandwidth} codecs='${best.codecs}' ${best.url}")
                 // 소리가 영상과 따로 있는 경우(별도 오디오 트랙) 같이 받을 수 있게 기록
-                val pa = M3u8.pickAudio(text, url, best)
-                Dbg.i("Detect", if (pa != null) "분리 오디오 선택 '${pa.name}' group=${pa.group} default=${pa.isDefault} ${pa.url}" else "분리 오디오 없음 (소리가 영상 조각 안에 있어야 함)")
-                pa?.let {
-                    audio = it
-                    variantUrls.add(it.url)
-                    children.add(it.url)
+                var pa = M3u8.pickAudio(text, url, best)
+                if (pa == null) {
+                    // EXT-X-MEDIA 없이 master 가 "소리 전용 variant" 를 따로 나열하는 경우
+                    val av = M3u8.pickAudioVariant(variants, best)
+                    if (av != null) {
+                        pa = M3u8.AudioRendition(av.url, "", "audio-variant ${av.bandwidth / 1000}kbps", true)
+                        Dbg.i("Detect", "소리 전용 variant 를 오디오로 사용 bw=${av.bandwidth} codecs='${av.codecs}' ${av.url}")
+                    }
+                }
+                val picked = pa
+                Dbg.i("Detect", if (picked != null) "분리 오디오 선택 '${picked.name}' group=${picked.group} default=${picked.isDefault} ${picked.url}" else "분리 오디오 없음 (소리가 영상 조각 안에 있어야 함)")
+                if (picked != null) {
+                    audio = picked
+                    variantUrls.add(picked.url)
+                    children.add(picked.url)
                 }
                 url = best.url
                 text = Http.getText(url, item)
@@ -185,6 +244,16 @@ object Detector {
                 it.keyMethod != null && it.keyMethod != "NONE" && it.keyMethod != "AES-128"
             }
             if (unsupported != null) throw IOException("지원하지 않는 암호화(${unsupported.keyMethod})")
+
+            // 첫 조각을 받아 이 재생목록이 영상인지/소리만인지/영상인데 소리가 없는지 확인
+            val probe = MediaProbe.probe(item, media)
+            Dbg.i("Detect", "조각 분석 video=${probe?.video} audio=${probe?.audio} (null=확인 못 함)")
+            if (probe != null && probe.video && probe.audio && audio != null) {
+                // 영상 조각 안에 이미 소리가 있으면 따로 받을 필요가 없다 (합치면 소리 트랙이 2개가 됨)
+                Dbg.i("Detect", "영상 조각에 소리 포함 -> 분리 오디오 무시")
+                audio = null
+            }
+            val audioOnly = probe != null && probe.audio && !probe.video
 
             // 별도 오디오 재생목록 받아서 저장
             var audioUrl = ""
@@ -229,18 +298,22 @@ object Detector {
                     subs = (declaredSubs + extra).distinctBy { s -> s.url },
                     mediaUrl = url,
                     audioUrl = audioUrl,
-                    resolution = resolution,
+                    resolution = if (audioOnly) "오디오" else resolution,
                     durationSec = media.duration,
                     segmentCount = media.segments.size,
                     encrypted = media.segments.any { s -> s.keyMethod == "AES-128" && s.keyUri != null },
                     isLive = media.live,
                     fmp4 = media.fmp4,
+                    audioOnly = audioOnly,
+                    noAudio = probe != null && probe.video && !probe.audio && audioUrl.isBlank(),
                     status = Status.READY,
                     error = ""
                 )
             }
-            Dbg.i("Detect", "목록 추가 '${item.title}' $resolution audioUrl=${audioUrl.ifBlank { "-" }}")
-            Repo.get(item.id)?.let { Repo.detected.tryEmit(it) }
+            Dbg.i("Detect", "목록 추가 '${item.title}' $resolution audioUrl=${audioUrl.ifBlank { "-" }} audioOnly=$audioOnly")
+            // 같은 페이지에서 따로 잡힌 영상/오디오 재생목록끼리 짝을 맞춘다 (짝이 되면 오디오 쪽 항목은 사라짐)
+            tryPair(item.id)
+            Repo.get(item.id)?.let { if (!it.audioOnly) Repo.detected.tryEmit(it) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

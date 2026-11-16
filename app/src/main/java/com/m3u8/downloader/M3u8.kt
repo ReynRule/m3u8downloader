@@ -17,6 +17,20 @@ object M3u8 {
                 return "mp4a" in c || listOf("ac-3", "ec-3", "ac-4").none { it in c }
             }
 
+        private val c get() = codecs.lowercase()
+
+        /** CODECS 에 소리 코덱이 선언돼 있는지 */
+        val hasAudioCodec: Boolean
+            get() = listOf("mp4a", "ac-3", "ec-3", "ac-4", "opus", "flac", "mp3").any { it in c }
+
+        /** CODECS 에 영상 코덱이 선언돼 있는지 */
+        val hasVideoCodec: Boolean
+            get() = listOf("avc1", "avc3", "hvc1", "hev1", "av01", "vp09", "vp9", "dvh1", "dvhe").any { it in c }
+
+        /** 소리만 있는 variant (master 가 영상 variant 와 오디오 variant 를 따로 나열하는 경우) */
+        val audioOnly: Boolean
+            get() = height == 0 && hasAudioCodec && !hasVideoCodec
+
         fun label(): String = when {
             height > 0 -> "${height}p"
             bandwidth > 0 -> "${bandwidth / 1000}kbps"
@@ -87,21 +101,36 @@ object M3u8 {
     class AudioRendition(val url: String, val group: String, val name: String, val isDefault: Boolean)
 
     /**
-     * [variant] 가 가리키는 오디오 그룹에서 별도 파일로 제공되는 오디오 하나를 고른다.
-     * URI 가 없으면(= 소리가 영상 안에 들어 있음) null.
+     * [variant] 의 소리가 별도 파일로 제공될 때 그 오디오 하나를 고른다. 소리가 영상 안에 들어 있으면 null.
+     * 1) AUDIO="그룹" 이 선언돼 있으면 그 그룹의 #EXT-X-MEDIA:TYPE=AUDIO (URI 가 없으면 영상 안에 포함)
+     * 2) AUDIO 속성이 없는데 영상 variant 가 소리 코덱을 선언하지 않았고 오디오 MEDIA 만 따로 있으면 그것
      */
     fun pickAudio(text: String, base: String, variant: Variant): AudioRendition? {
-        if (variant.audioGroup.isBlank()) return null
-        val list = ArrayList<AudioRendition>()
+        val all = ArrayList<AudioRendition>()
         for (raw in text.lineSequence()) {
             val line = raw.trim()
             if (!line.startsWith("#EXT-X-MEDIA:")) continue
             val a = attrs(line.substringAfter(':'))
-            if (a["TYPE"] != "AUDIO" || a["GROUP-ID"] != variant.audioGroup) continue
+            if (a["TYPE"] != "AUDIO") continue
             val uri = a["URI"] ?: continue
-            list.add(AudioRendition(resolve(base, uri), variant.audioGroup, a["NAME"] ?: "", a["DEFAULT"] == "YES"))
+            all.add(AudioRendition(resolve(base, uri), a["GROUP-ID"] ?: "", a["NAME"] ?: "", a["DEFAULT"] == "YES"))
         }
-        return list.firstOrNull { it.isDefault } ?: list.firstOrNull()
+        val pool = when {
+            variant.audioGroup.isNotBlank() -> all.filter { it.group == variant.audioGroup }
+            variant.hasAudioCodec -> emptyList() // 소리가 영상에 들어 있다고 선언됨
+            else -> all
+        }
+        return pool.firstOrNull { it.isDefault } ?: pool.firstOrNull()
+    }
+
+    /**
+     * master 가 EXT-X-MEDIA 없이 "소리 전용 variant" 를 따로 나열하는 경우, [best] (영상 variant) 와 짝이 될
+     * 소리 variant. AAC 우선, 그 안에서 비트레이트가 높은 것. [best] 가 이미 소리를 갖고 있으면 null.
+     */
+    fun pickAudioVariant(variants: List<Variant>, best: Variant): Variant? {
+        if (best.audioOnly || best.hasAudioCodec) return null
+        return variants.filter { it.audioOnly && it.url != best.url }
+            .maxWithOrNull(compareBy<Variant>({ it.aacAudio }, { it.bandwidth }))
     }
 
     /** master 재생목록의 자막 트랙(#EXT-X-MEDIA:TYPE=SUBTITLES). 강제 자막(FORCED=YES)은 제외 */

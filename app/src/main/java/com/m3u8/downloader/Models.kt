@@ -26,6 +26,10 @@ data class VideoItem(
     val encrypted: Boolean = false,
     val isLive: Boolean = false,
     val fmp4: Boolean = false,
+    /** 이 재생목록은 영상 없이 소리만 있음 (오디오 전용 m3u8) */
+    val audioOnly: Boolean = false,
+    /** 영상 조각에 소리가 없고 아직 짝이 되는 오디오 재생목록도 못 찾음 -> 그대로 받으면 무음 */
+    val noAudio: Boolean = false,
     val subs: List<SubTrack> = emptyList(),
     val subInfo: String = "",
     val status: Status = Status.ANALYZING,

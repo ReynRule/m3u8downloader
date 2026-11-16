@@ -36,6 +36,9 @@ class VideoAdapter(
         if (item.encrypted) meta.add("AES-128")
         if (item.isLive) meta.add("LIVE")
         if (item.fmp4) meta.add("fMP4")
+        if (item.audioOnly) meta.add("🔊 오디오 전용")
+        else if (item.audioUrl.isNotEmpty()) meta.add("🔊 소리 연결됨")
+        else if (item.noAudio) meta.add("🔇 소리 없음(오디오 대기)")
         if (item.subs.isNotEmpty()) meta.add("자막 ${item.subs.size}")
         b.tvMeta.text = if (meta.isEmpty()) hostOf(item) else meta.joinToString(" · ")
 

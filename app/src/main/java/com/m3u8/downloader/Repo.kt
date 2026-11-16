@@ -134,6 +134,8 @@ object Repo {
         put("encrypted", v.encrypted)
         put("isLive", v.isLive)
         put("fmp4", v.fmp4)
+        put("audioOnly", v.audioOnly)
+        put("noAudio", v.noAudio)
         put("subInfo", v.subInfo)
         put("subs", JSONArray().apply {
             v.subs.forEach {
@@ -166,6 +168,8 @@ object Repo {
         encrypted = o.optBoolean("encrypted"),
         isLive = o.optBoolean("isLive"),
         fmp4 = o.optBoolean("fmp4"),
+        audioOnly = o.optBoolean("audioOnly"),
+        noAudio = o.optBoolean("noAudio"),
         subInfo = o.optString("subInfo"),
         subs = o.optJSONArray("subs")?.let { a ->
             (0 until a.length()).map { i ->
