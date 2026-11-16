@@ -7,8 +7,16 @@ object M3u8 {
 
     data class Variant(
         val url: String, val bandwidth: Long, val width: Int, val height: Int,
-        val audioGroup: String = ""
+        val audioGroup: String = "",
+        val codecs: String = ""
     ) {
+        /** MP4 로 합칠 수 있는 소리(AAC)인지. CODECS 에 AC-3/E-AC-3 등만 있으면 false */
+        val aacAudio: Boolean
+            get() {
+                val c = codecs.lowercase()
+                return "mp4a" in c || listOf("ac-3", "ec-3", "ac-4").none { it in c }
+            }
+
         fun label(): String = when {
             height > 0 -> "${height}p"
             bandwidth > 0 -> "${bandwidth / 1000}kbps"
@@ -27,7 +35,11 @@ object M3u8 {
         val rangeLen: Long
     )
 
-    class Media(val segments: List<Segment>, val mapUrl: String?, val live: Boolean) {
+    /** [mapStart]/[mapLen]: 초기화 세그먼트(EXT-X-MAP)의 BYTERANGE (없으면 파일 전체 = -1) */
+    class Media(
+        val segments: List<Segment>, val mapUrl: String?, val live: Boolean,
+        val mapStart: Long = 0L, val mapLen: Long = -1L
+    ) {
         val duration: Double get() = segments.sumOf { it.duration }
         val fmp4: Boolean get() = mapUrl != null
     }
@@ -63,7 +75,7 @@ object M3u8 {
                     val w = res?.getOrNull(0)?.toIntOrNull() ?: 0
                     val h = res?.getOrNull(1)?.toIntOrNull() ?: 0
                     val bw = p["BANDWIDTH"]?.toLongOrNull() ?: p["AVERAGE-BANDWIDTH"]?.toLongOrNull() ?: 0L
-                    out.add(Variant(resolve(base, line), bw, w, h, p["AUDIO"] ?: ""))
+                    out.add(Variant(resolve(base, line), bw, w, h, p["AUDIO"] ?: "", p["CODECS"] ?: ""))
                     pending = null
                 }
             }
@@ -134,6 +146,8 @@ object M3u8 {
         var rLen = -1L
         var lastEnd = 0L
         var mapUrl: String? = null
+        var mapStart = 0L
+        var mapLen = -1L
         var ended = false
         var index = 0
         val segs = ArrayList<Segment>()
@@ -163,8 +177,17 @@ object M3u8 {
 
                     line.startsWith("#EXT-X-MAP:") -> {
                         if (mapUrl == null) {
-                            val u = attrs(line.substringAfter(':'))["URI"]
-                            if (u != null) mapUrl = resolve(base, u)
+                            val a = attrs(line.substringAfter(':'))
+                            val u = a["URI"]
+                            if (u != null) {
+                                mapUrl = resolve(base, u)
+                                // 영상 전체가 한 파일(main.mp4)이고 init 은 그 앞부분 일부인 경우.
+                                // 무시하면 init 대신 파일 전체를 한 연결로 받느라 매우 느리고 메모리 부족으로 실패함
+                                a["BYTERANGE"]?.let { br ->
+                                    mapLen = br.substringBefore('@').toLongOrNull() ?: -1L
+                                    mapStart = br.substringAfter('@', "0").toLongOrNull() ?: 0L
+                                }
+                            }
                         }
                     }
 
@@ -187,7 +210,7 @@ object M3u8 {
                 rStart = 0L
             }
         }
-        return Media(segs, mapUrl, !ended)
+        return Media(segs, mapUrl, !ended, mapStart, mapLen)
     }
 
     /** 상대경로를 모두 절대경로로 바꾼 "병합된(해석 완료된)" 재생목록 텍스트 */

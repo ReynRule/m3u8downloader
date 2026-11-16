@@ -141,7 +141,9 @@ object Detector {
                 if (variants.isEmpty()) throw IOException("화질 목록을 찾을 수 없습니다")
                 variantUrls.addAll(variants.map { it.url })
                 children.addAll(variants.map { it.url })
-                val best = variants.maxWith(compareBy<M3u8.Variant>({ it.bandwidth }, { it.height }))
+                // 같은 화질이 AAC / AC-3·E-AC-3 소리로 나뉘어 있으면 AAC 쪽을 고른다
+                // (AC-3 계열은 MP4 로 합칠 수 없어 실패하거나 소리 없는 파일이 됨)
+                val best = variants.maxWith(compareBy<M3u8.Variant>({ it.aacAudio }, { it.bandwidth }, { it.height }))
                 resolution = best.label()
                 // 소리가 영상과 따로 있는 경우(별도 오디오 트랙) 같이 받을 수 있게 기록
                 M3u8.pickAudio(text, url, best)?.let {
