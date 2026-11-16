@@ -60,6 +60,27 @@ object Remuxer {
         return sb.toString()
     }
 
+    /**
+     * 패킹된 .aac(ADTS) 에서 MediaExtractor 가 샘플을 ADTS 헤더(7바이트, CRC 있으면 9바이트)째로 넘겨주는 경우가 있다.
+     * MP4(esds/AudioSpecificConfig 기반)에는 헤더 없는 raw AAC 프레임만 들어가야 하므로 여기서 헤더를 떼어낸다.
+     * VLC/ffmpeg 는 헤더가 남아 있어도 무시하지만 Windows 기본 플레이어, 안드로이드 갤러리, iOS 는 소리를 못 낸다.
+     *
+     * 오탐(raw 프레임이 우연히 0xFFF 로 시작) 방지를 위해 헤더의 frame_length 가 샘플 크기와 정확히 같을 때만 제거한다.
+     * @return 제거할 헤더 크기 (헤더가 없으면 0)
+     */
+    private fun adtsHeaderSize(a: ByteArray, size: Int): Int {
+        if (size < 7) return 0
+        val b0 = a[0].toInt() and 0xFF
+        val b1 = a[1].toInt() and 0xFF
+        if (b0 != 0xFF || (b1 and 0xF6) != 0xF0) return 0 // syncword 12bit + layer 00 (MPEG ver 은 무시)
+        val hdr = if ((b1 and 0x01) == 0) 9 else 7 // protection_absent == 0 이면 CRC 2바이트 추가
+        val frameLen = ((a[3].toInt() and 0x03) shl 11) or
+            ((a[4].toInt() and 0xFF) shl 3) or
+            ((a[5].toInt() and 0xE0) ushr 5)
+        if (frameLen != size || size <= hdr) return 0
+        return hdr
+    }
+
     /** 성공하면 입력들의 첫 샘플 중 가장 이른 시간(마이크로초) = 출력에서 0 이 되는 기준 시간 */
     private fun process(srcs: List<File>, dst: File, offsets: LongArray = LongArray(srcs.size)): Long? {
         Dbg.i("Remux", "시작 ${srcs.joinToString(" + ") { "${it.name}(${it.length()}B)" }} -> ${dst.name}")
@@ -70,6 +91,7 @@ object Remuxer {
             mux = m
 
             val maps = ArrayList<HashMap<Int, Int>>()
+            val aacTracks = HashSet<Int>() // 출력 MP4 의 AAC 오디오 트랙 번호 (ADTS 헤더 제거 대상)
             for (src in srcs) {
                 val ex = MediaExtractor()
                 exs.add(ex)
@@ -88,6 +110,7 @@ object Remuxer {
                     }
                     ex.selectTrack(i)
                     map[i] = m.addTrack(f)
+                    if (mime == "audio/mp4a-latm") aacTracks.add(map[i]!!)
                 }
                 maps.add(map)
             }
@@ -117,6 +140,7 @@ object Remuxer {
             val base = firsts.minOrNull() ?: return null
             Dbg.i("Remux", "첫 샘플 시간(us) ${firstAll.joinToString()} 보정 ${eff.joinToString()} base=$base")
             val counts = HashMap<Int, Int>()
+            var adtsStripped = 0
 
             m.start()
             val buf = ByteBuffer.allocate(8 * 1024 * 1024)
@@ -142,14 +166,26 @@ object Remuxer {
                 if (track != null) {
                     val flags = if (ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0)
                         MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                    info.set(0, size, maxOf(0L, kt - base), flags)
+                    var outSize = size
+                    if (track in aacTracks && buf.hasArray()) {
+                        val arr = buf.array()
+                        val hdr = adtsHeaderSize(arr, size)
+                        if (hdr > 0) {
+                            System.arraycopy(arr, hdr, arr, 0, size - hdr)
+                            outSize = size - hdr
+                            adtsStripped++
+                        }
+                    }
+                    buf.position(0)
+                    buf.limit(outSize)
+                    info.set(0, outSize, maxOf(0L, kt - base), flags)
                     m.writeSampleData(track, buf, info)
                     counts[track] = (counts[track] ?: 0) + 1
                 }
                 ex.advance()
             }
             m.stop()
-            Dbg.i("Remux", "완료 ${dst.name} ${dst.length()}B, 출력 트랙별 샘플 수 $counts")
+            Dbg.i("Remux", "완료 ${dst.name} ${dst.length()}B, 출력 트랙별 샘플 수 $counts, ADTS 헤더 제거 $adtsStripped")
             return maxOf(0L, base)
         } catch (e: Exception) {
             Dbg.e("Remux", "예외로 실패", e)
