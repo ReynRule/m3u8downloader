@@ -39,6 +39,8 @@ object Downloader {
 
     private suspend fun doRun(ctx: Context, itemId: String) {
         val item = Repo.get(itemId) ?: return
+        val t0 = SystemClock.elapsedRealtime()
+        Dbg.i("DL", "시작 '${item.title}' ${item.resolution} id=$itemId")
         val pl = Repo.playlistFile(itemId)
         if (!pl.exists()) throw IOException("재생목록 파일이 없습니다")
 
@@ -53,6 +55,11 @@ object Downloader {
         val asegs = amedia?.segments ?: emptyList()
         val hasAudio = asegs.isNotEmpty()
         val afmp4 = hasAudio && amedia?.mapUrl != null
+
+        Dbg.i("DL", "영상 조각 ${segs.size}개 fmp4=$fmp4 map=${media.mapUrl} | 오디오 ${if (hasAudio) "분리 ${asegs.size}개 afmp4=$afmp4 map=${amedia?.mapUrl}" else "분리 아님(영상에 포함 or 없음)"}")
+        Dbg.i("DL", "첫 영상 조각 ${segs.first().url} key=${segs.first().keyMethod}")
+        if (hasAudio) Dbg.i("DL", "첫 오디오 조각 ${asegs.first().url} key=${asegs.first().keyMethod}")
+        Dbg.i("DL", "설정 convertMp4=${Repo.convertMp4} mergeSubs=${Repo.mergeSubs}")
 
         val dir = File(ctx.filesDir, "dl/$itemId").apply { mkdirs() }
         val total = segs.size + asegs.size + (if (fmp4) 1 else 0) + (if (afmp4) 1 else 0)
@@ -80,7 +87,8 @@ object Downloader {
         }
         val onThrottle: (Exception) -> Unit = {
             okStreak.set(0)
-            limit.updateAndGet { maxOf(MIN_THREADS, it - 2) }
+            val prev = limit.getAndUpdate { maxOf(MIN_THREADS, it - 2) }
+            if (prev > MIN_THREADS) Dbg.i("DL", "서버 제한(${it.message}) -> 동시 ${maxOf(MIN_THREADS, prev - 2)}개로 감속")
         }
 
         val keyCache = ConcurrentHashMap<String, ByteArray>()
@@ -97,6 +105,7 @@ object Downloader {
             if (!initFile.exists() || initFile.length() == 0L) {
                 initFile.writeBytes(fetchBytes(media.mapUrl!!, item, media.mapStart, media.mapLen))
             }
+            Dbg.i("DL", "영상 init ${initFile.length()}B (range ${media.mapStart}/${media.mapLen}) ${Dbg.hex(initFile.readBytes())}")
             report(done.incrementAndGet())
         }
         val ainitFile = File(dir, "ainit.bin")
@@ -104,6 +113,7 @@ object Downloader {
             if (!ainitFile.exists() || ainitFile.length() == 0L) {
                 ainitFile.writeBytes(fetchBytes(amedia!!.mapUrl!!, item, amedia.mapStart, amedia.mapLen))
             }
+            Dbg.i("DL", "오디오 init ${ainitFile.length()}B (range ${amedia!!.mapStart}/${amedia.mapLen}) ${Dbg.hex(ainitFile.readBytes())}")
             report(done.incrementAndGet())
         }
 
@@ -118,6 +128,8 @@ object Downloader {
             .distinct().forEach { keyFor(it) }
 
         // 병렬 다운로드 (이미 받은 조각은 건너뜀 -> 이어받기)
+        val skipped = tasks.count { File(dir, it.name).let { f -> f.exists() && f.length() > 0 } }
+        if (skipped > 0) Dbg.i("DL", "이어받기: 이미 받은 조각 $skipped/${tasks.size}개 건너뜀")
         val next = AtomicInteger(0)
         coroutineScope {
             repeat(MAX_THREADS) { w ->
@@ -140,7 +152,12 @@ object Downloader {
                             if (s.keyMethod == "AES-128" && s.keyUri != null) {
                                 data = decrypt(data, keyFor(s.keyUri), ivFor(s))
                             }
+                            val raw = data
                             if (t.stripHeader) data = stripFakeHeader(stripId3(data))
+                            // 첫 조각은 포맷 확인용으로 앞 바이트 기록 (47=TS, ff f1=ADTS AAC, 49 44 33=ID3)
+                            if (t.name == "000000.seg" || t.name == "a000000.seg") {
+                                Dbg.i("DL", "${t.name} ${raw.size}B 원본 [${Dbg.hex(raw)}] -> 정리 후 ${data.size}B [${Dbg.hex(data)}]")
+                            }
                             val tmp = File(dir, t.name.removeSuffix(".seg") + ".tmp")
                             tmp.writeBytes(data)
                             if (!tmp.renameTo(out)) throw IOException("파일 저장 실패")
@@ -153,6 +170,7 @@ object Downloader {
         }
 
         // 병합
+        Dbg.i("DL", "조각 다운로드 완료 ${(SystemClock.elapsedRealtime() - t0) / 1000}s, 최종 동시성 ${limit.get()}")
         Repo.update(itemId) { it.copy(status = Status.MERGING, progress = 100) }
         suspend fun mergeStream(dst: File, init: File?, names: List<String>) {
             dst.outputStream().buffered(1 shl 16).use { os ->
@@ -167,6 +185,7 @@ object Downloader {
         }
         val merged = File(dir, if (fmp4) "merged.mp4" else "merged.ts")
         mergeStream(merged, if (fmp4) initFile else null, tasks.filter { !it.name.startsWith("a") }.map { it.name })
+        Dbg.i("DL", "영상 병합 " + Remuxer.describe(merged))
 
         var finalFile = merged
         var mime = if (fmp4) "video/mp4" else "video/mp2t"
@@ -177,8 +196,10 @@ object Downloader {
         if (hasAudio) {
             val audioMerged = File(dir, if (afmp4) "audio.mp4" else "audio.ts")
             mergeStream(audioMerged, if (afmp4) ainitFile else null, tasks.filter { it.name.startsWith("a") }.map { it.name })
+            Dbg.i("DL", "오디오 병합 " + Remuxer.describe(audioMerged))
             val muxed = File(dir, "muxed.mp4")
             val baseUs = Remuxer.mux(merged, audioMerged, muxed)
+            Dbg.i("DL", "영상+오디오 합치기 결과 baseUs=$baseUs size=${muxed.length()}")
             audioMerged.delete()
             if (baseUs == null || muxed.length() == 0L) {
                 muxed.delete()
@@ -198,6 +219,7 @@ object Downloader {
         var baseMs = 0L
         if (Repo.mergeSubs && SubtitleFetcher.candidates(item).isNotEmpty()) {
             subs = SubtitleFetcher.collect(item)
+            Dbg.i("DL", "자막 후보 ${SubtitleFetcher.candidates(item).size}개 -> 불러옴 ${subs.size}개")
             if (subs.isEmpty()) subInfo = "자막을 불러오지 못했습니다"
         }
         if (subs.isNotEmpty()) {
@@ -221,10 +243,13 @@ object Downloader {
                 }
             }
             val langs = subs.joinToString(", ") { it.lang.ifBlank { it.name } }
+            Dbg.i("DL", "자막 합치기 embedded=$embedded")
             subInfo = if (embedded) "자막 ${subs.size}개 합침 ($langs)" else "자막을 영상에 합치지 못해 .srt 로 따로 저장"
         } else if (!fmp4 && !hasAudio && Repo.convertMp4) {
             val mp4 = File(dir, "out.mp4")
-            if (Remuxer.toMp4(merged, mp4) && mp4.length() > 0) {
+            val ok = Remuxer.toMp4(merged, mp4) && mp4.length() > 0
+            Dbg.i("DL", "MP4 변환 ${if (ok) "성공" else "실패 -> .ts 그대로 저장"}")
+            if (ok) {
                 merged.delete()
                 finalFile = mp4
                 mime = "video/mp4"
@@ -236,7 +261,11 @@ object Downloader {
 
         val base = sanitize(item.title) + (if (item.resolution.isNotEmpty()) "_${item.resolution}" else "")
         val name = "$base.$ext"
+        // 최종 파일에 소리 트랙이 실제로 있는지 확인 (소리 안 남 진단용)
+        Dbg.i("DL", "최종 " + Remuxer.describe(finalFile))
+        if (!Remuxer.hasAudio(finalFile)) Dbg.e("DL", "최종 파일에 오디오 트랙 없음! (소리 안 나는 원인)")
         val uri = saveToMediaStore(ctx, finalFile, name, mime)
+        Dbg.i("DL", "저장 완료 $name ($mime) -> $uri, 총 ${(SystemClock.elapsedRealtime() - t0) / 1000}s")
         dir.deleteRecursively()
 
         // 합치지 못한 자막은 .srt 로 따로 저장 (플레이어가 같은 이름이면 자동으로 불러옴)
@@ -284,7 +313,9 @@ object Downloader {
                         throw HttpErr(r.code, ra)
                     }
                     val bytes = r.body!!.bytes()
-                    if (light && !preferLight && last is HttpErr) lightHosts.add(host)
+                    if (light && !preferLight && last is HttpErr && lightHosts.add(host)) {
+                        Dbg.i("HTTP", "$host: 최소 헤더로만 응답 -> 이후 최소 헤더 사용")
+                    }
                     return bytes
                 }
             } catch (e: CancellationException) {
@@ -299,9 +330,11 @@ object Downloader {
                 if (attempt == max - 1) break
                 val backoff = minOf(8000L, 700L * (1L shl attempt)) + (0..400).random()
                 val wait = if (e is HttpErr) maxOf(backoff, minOf(e.retryAfterMs, 15000L)) else backoff
+                Dbg.i("HTTP", "재시도 ${attempt + 1}/$max ${e.message} light=$light ${wait}ms 후 | ${url.substringAfterLast('/').take(80)}")
                 delay(wait)
             }
         }
+        Dbg.e("HTTP", "최종 실패 $url", last)
         throw IOException("다운로드 실패: ${last?.message ?: "알 수 없는 오류"} (${Http.hostOf(url)})")
     }
 
@@ -393,7 +426,7 @@ object Downloader {
                 os.use { it.write(text.toByteArray(Charsets.UTF_8)) }
                 return
             } catch (e: Exception) {
-                // 다음 위치로 재시도
+                Dbg.e("DL", "자막 파일 저장 실패 ($rel/$name)", e)
             }
         }
     }

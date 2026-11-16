@@ -62,6 +62,7 @@ object Detector {
         if (url in subSegs) return
         // 이 페이지가 HLS 자막 재생목록을 쓰면, 개별 .vtt 는 그 조각이므로 무시
         if (pageUrl in hlsSubPages) return
+        if (pageSubs[pageUrl]?.any { it.url == url } != true) Dbg.i("Detect", "자막 파일 감지 $url")
         addPageSub(pageUrl, SubTrack(url, guessLang(url), url.substringBefore('?').substringAfterLast('/')))
     }
 
@@ -95,6 +96,7 @@ object Detector {
             return
         }
         if (!seen.add(url)) return
+        Dbg.i("Detect", "m3u8 후보 감지 $url (page=$pageUrl, referer=$referer)")
 
         val cookie = try {
             CookieManager.getInstance().getCookie(url) ?: ""
@@ -121,6 +123,7 @@ object Detector {
             var text = Http.getText(url, item)
             if (!text.trimStart().startsWith("#EXTM3U")) {
                 // m3u8 이 아닌 요청(오탐) -> 조용히 제거
+                Dbg.i("Detect", "m3u8 아님(오탐) 제거: ${text.take(40).replace('\n', ' ')}")
                 Repo.remove(listOf(item.id))
                 return
             }
@@ -132,6 +135,11 @@ object Detector {
             var guard = 0
             while (M3u8.isMaster(text) && guard++ < 3) {
                 val variants = M3u8.parseMaster(text, url)
+                Dbg.i("Detect", "master $url variant ${variants.size}개")
+                variants.forEach { v ->
+                    Dbg.i("Detect", "  ${v.label()} bw=${v.bandwidth} codecs='${v.codecs}' audio='${v.audioGroup}' aac=${v.aacAudio}")
+                }
+                text.lineSequence().filter { it.startsWith("#EXT-X-MEDIA:") }.forEach { Dbg.i("Detect", "  $it") }
                 val ms = M3u8.parseMasterSubtitles(text, url)
                 if (ms.isNotEmpty()) {
                     declaredSubs = declaredSubs + ms
@@ -145,8 +153,11 @@ object Detector {
                 // (AC-3 계열은 MP4 로 합칠 수 없어 실패하거나 소리 없는 파일이 됨)
                 val best = variants.maxWith(compareBy<M3u8.Variant>({ it.aacAudio }, { it.bandwidth }, { it.height }))
                 resolution = best.label()
+                Dbg.i("Detect", "선택 variant ${best.label()} bw=${best.bandwidth} codecs='${best.codecs}' ${best.url}")
                 // 소리가 영상과 따로 있는 경우(별도 오디오 트랙) 같이 받을 수 있게 기록
-                M3u8.pickAudio(text, url, best)?.let {
+                val pa = M3u8.pickAudio(text, url, best)
+                Dbg.i("Detect", if (pa != null) "분리 오디오 선택 '${pa.name}' group=${pa.group} default=${pa.isDefault} ${pa.url}" else "분리 오디오 없음 (소리가 영상 조각 안에 있어야 함)")
+                pa?.let {
                     audio = it
                     variantUrls.add(it.url)
                     children.add(it.url)
@@ -157,10 +168,12 @@ object Detector {
             }
 
             val media = M3u8.parseMedia(text, url)
+            Dbg.i("Detect", "media $url 조각 ${media.segments.size}개 ${media.duration.toInt()}s fmp4=${media.fmp4} map=${media.mapUrl} live=${media.live} key=${media.segments.firstOrNull()?.keyMethod} 첫조각=${media.segments.firstOrNull()?.url}")
             if (media.segments.isEmpty()) throw IOException("영상 조각(segment)이 없습니다")
 
             // 영상이 아니라 자막 재생목록(.vtt 조각)이면 -> 목록에서 빼고 자막 후보로만 기록
             if (M3u8.isSubtitleMedia(media)) {
+                Dbg.i("Detect", "자막 재생목록이라 영상 목록에서 제외 $url")
                 Repo.remove(listOf(item.id))
                 hlsSubPages.add(item.pageUrl)
                 subSegs.addAll(media.segments.map { it.url })
@@ -179,6 +192,7 @@ object Detector {
                 val at = Http.getText(a.url, item)
                 if (!at.trimStart().startsWith("#EXTM3U")) throw IOException("잘못된 오디오 재생목록 응답")
                 val am = M3u8.parseMedia(at, a.url)
+                Dbg.i("Detect", "오디오 media 조각 ${am.segments.size}개 fmp4=${am.fmp4} map=${am.mapUrl} key=${am.segments.firstOrNull()?.keyMethod} 첫조각=${am.segments.firstOrNull()?.url}")
                 if (am.segments.isEmpty()) throw IOException("오디오 조각(segment)이 없습니다")
                 val badAudio = am.segments.firstOrNull {
                     it.keyMethod != null && it.keyMethod != "NONE" && it.keyMethod != "AES-128"
@@ -199,6 +213,7 @@ object Detector {
             // 같은 영상이 이미 목록에 있으면 중복 제거
             val dup = Repo.items.value.any { it.id != item.id && it.mediaUrl == url }
             if (dup) {
+                Dbg.i("Detect", "이미 목록에 있는 영상 -> 중복 제거")
                 Repo.remove(listOf(item.id))
                 return
             }
@@ -224,10 +239,12 @@ object Detector {
                     error = ""
                 )
             }
+            Dbg.i("Detect", "목록 추가 '${item.title}' $resolution audioUrl=${audioUrl.ifBlank { "-" }}")
             Repo.get(item.id)?.let { Repo.detected.tryEmit(it) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            Dbg.e("Detect", "분석 실패 ${item.sourceUrl}", e)
             Repo.update(item.id) {
                 it.copy(status = Status.FAILED, error = e.message ?: "분석 실패")
             }

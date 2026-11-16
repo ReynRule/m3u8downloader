@@ -44,9 +44,9 @@ class ListFragment : Fragment() {
         (b.rv.itemAnimator as? SimpleItemAnimator)?.supportsChangeAnimations = false
 
         b.cbMp4.isChecked = Repo.convertMp4
-        b.cbMp4.setOnCheckedChangeListener { _, c -> Repo.convertMp4 = c }
+        b.cbMp4.setOnCheckedChangeListener { _, c -> Repo.convertMp4 = c; Dbg.i("UI", "MP4 변환 = $c") }
         b.cbSubs.isChecked = Repo.mergeSubs
-        b.cbSubs.setOnCheckedChangeListener { _, c -> Repo.mergeSubs = c }
+        b.cbSubs.setOnCheckedChangeListener { _, c -> Repo.mergeSubs = c; Dbg.i("UI", "자막 합치기 = $c") }
 
         b.cbAll.setOnClickListener {
             if (b.cbAll.isChecked) selected.addAll(current.map { it.id }) else selected.clear()
@@ -100,6 +100,7 @@ class ListFragment : Fragment() {
             .filter { it.id in selected && (it.status == Status.READY || it.status == Status.FAILED) }
             .map { it.id }
         if (ids.isEmpty()) return
+        Dbg.i("UI", "선택 다운로드 클릭: " + current.filter { it.id in ids }.joinToString { "'${it.title}'(${it.status})" })
         DownloadCenter.enqueue(requireContext(), ids)
         Toast.makeText(requireContext(), "${ids.size}개 다운로드를 시작합니다", Toast.LENGTH_SHORT).show()
         selected.clear()
@@ -120,6 +121,7 @@ class ListFragment : Fragment() {
     }
 
     private fun doDelete(ids: List<String>) {
+        Dbg.i("UI", "선택 삭제 ${ids.size}개")
         val urls = current.filter { it.id in ids }.map { it.sourceUrl }
         Detector.forget(urls)
         DownloadCenter.cancelAndClean(ids)
@@ -144,6 +146,7 @@ class ListFragment : Fragment() {
             .setView(box)
             .setPositiveButton("확인") { _, _ ->
                 val t = et.text.toString().trim()
+                if (t.isNotEmpty()) Dbg.i("UI", "이름 변경 '${item.title}' -> '$t'")
                 if (t.isNotEmpty()) Repo.update(item.id) { it.copy(title = t) }
             }
             .setNegativeButton("취소", null)
@@ -151,6 +154,7 @@ class ListFragment : Fragment() {
     }
 
     private fun open(item: VideoItem) {
+        Dbg.i("UI", "재생 열기 ${item.outputName} ${item.outputUri}")
         val mime = if (item.outputName.endsWith(".ts")) "video/mp2t" else "video/mp4"
         try {
             startActivity(
@@ -159,6 +163,7 @@ class ListFragment : Fragment() {
                     .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             )
         } catch (e: Exception) {
+            Dbg.e("UI", "재생 열기 실패", e)
             Toast.makeText(requireContext(), "재생할 수 있는 앱이 없거나 파일이 삭제되었습니다", Toast.LENGTH_SHORT).show()
         }
     }

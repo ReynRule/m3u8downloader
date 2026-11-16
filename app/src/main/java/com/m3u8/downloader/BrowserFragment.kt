@@ -91,6 +91,7 @@ class BrowserFragment : Fragment() {
                 loadFailed = true
                 val code = error?.errorCode ?: return
                 val desc = error?.description?.toString().orEmpty()
+                Dbg.e("Web", "페이지 오류 $code $desc ${request.url}")
                 if (!isTransientError(code, desc)) return
                 val failed = request.url.toString()
                 if (failed != retryUrl) {
@@ -99,6 +100,7 @@ class BrowserFragment : Fragment() {
                 }
                 if (retryCount >= RETRY_DELAYS.size) return
                 val delayMs = RETRY_DELAYS[retryCount]
+                Dbg.i("Web", "자동 재시도 ${retryCount + 1} (${delayMs}ms 후)")
                 retryCount++
                 _b?.progress?.visibility = View.VISIBLE
                 cancelPendingRetry()
@@ -118,6 +120,7 @@ class BrowserFragment : Fragment() {
                 // 사용자가 직접 연 로드(주소 입력/새로고침/링크)면 재시도 횟수를 처음부터
                 if (autoRetrying) autoRetrying = false else retryCount = 0
                 curUrl = url ?: ""
+                Dbg.i("Web", "페이지 시작 $url")
                 _b?.let {
                     it.progress.visibility = View.VISIBLE
                     if (!it.url.hasFocus()) it.url.setText(url)
@@ -125,6 +128,7 @@ class BrowserFragment : Fragment() {
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
+                Dbg.i("Web", "페이지 완료 $url (실패=$loadFailed)")
                 if (!loadFailed) retryCount = 0
                 if (!loadFailed || pendingRetry == null) _b?.progress?.visibility = View.INVISIBLE
                 CookieManager.getInstance().flush()
@@ -158,6 +162,7 @@ class BrowserFragment : Fragment() {
                 b.fullscreen.addView(view)
                 b.fullscreen.visibility = View.VISIBLE
                 (activity as? MainActivity)?.setVideoFullscreen(true)
+                Dbg.i("Web", "전체화면 진입")
             }
 
             override fun onHideCustomView() {
@@ -194,6 +199,7 @@ class BrowserFragment : Fragment() {
         }
         cancelPendingRetry()
         retryCount = 0
+        Dbg.i("Web", "주소 이동 $u")
         b.web.loadUrl(u)
         val imm = requireContext().getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(b.url.windowToken, 0)
