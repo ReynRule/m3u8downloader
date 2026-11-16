@@ -33,6 +33,7 @@ class DownloadService : Service() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         )
         if (job == null) {
+            Dbg.i("Service", "포그라운드 서비스 시작")
             val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
             job = scope.launch {
                 Repo.items.collect { all ->
@@ -53,6 +54,7 @@ class DownloadService : Service() {
     }
 
     override fun onDestroy() {
+        Dbg.i("Service", "서비스 종료")
         scope.cancel()
         super.onDestroy()
     }

@@ -26,6 +26,7 @@ object DownloadCenter {
             val st = Repo.get(id)?.status
             st == Status.READY || st == Status.FAILED
         }
+        Dbg.i("Queue", "다운로드 요청 ${ids.size}개 -> 대상 ${targets.size}개")
         if (targets.isEmpty()) return
 
         targets.forEach { id ->
@@ -42,8 +43,10 @@ object DownloadCenter {
                         Downloader.run(app, id)
                     }
                 } catch (e: CancellationException) {
+                    Dbg.i("Queue", "취소됨 id=$id")
                     throw e
                 } catch (e: Throwable) {
+                    Dbg.e("Queue", "다운로드 실패 id=$id", e)
                     Repo.update(id) {
                         it.copy(status = Status.FAILED, error = e.message ?: e.javaClass.simpleName)
                     }
@@ -56,6 +59,7 @@ object DownloadCenter {
 
     fun cancelAndClean(ids: Collection<String>) {
         val running = ids.mapNotNull { jobs.remove(it) }
+        if (running.isNotEmpty()) Dbg.i("Queue", "진행 중 ${running.size}개 취소")
         scope.launch(Dispatchers.IO) {
             running.forEach { it.cancelAndJoin() }
             ids.forEach { File(Repo.appContext.filesDir, "dl/$it").deleteRecursively() }

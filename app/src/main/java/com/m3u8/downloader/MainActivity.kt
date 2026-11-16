@@ -60,6 +60,10 @@ class MainActivity : AppCompatActivity() {
             when (it.itemId) {
                 R.id.nav_browser -> showTab(0)
                 R.id.nav_list -> showTab(1)
+                R.id.nav_log -> {
+                    startActivity(android.content.Intent(this, LogActivity::class.java))
+                    return@setOnItemSelectedListener false
+                }
             }
             true
         }
@@ -107,6 +111,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showTab(i: Int) {
+        if (tab != i) Dbg.i("UI", if (i == 0) "브라우저 탭" else "목록 탭")
         tab = i
         supportFragmentManager.beginTransaction().apply {
             if (i == 0) {

@@ -33,7 +33,7 @@ object SubtitleFetcher {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                // 이 자막만 건너뜀
+                Dbg.e("Sub", "자막 불러오기 실패 ${t.url}", e)
             }
         }
         return out
