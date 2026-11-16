@@ -95,14 +95,14 @@ object Downloader {
         val initFile = File(dir, "init.bin")
         if (fmp4) {
             if (!initFile.exists() || initFile.length() == 0L) {
-                initFile.writeBytes(fetchBytes(media.mapUrl!!, item, 0, -1))
+                initFile.writeBytes(fetchBytes(media.mapUrl!!, item, media.mapStart, media.mapLen))
             }
             report(done.incrementAndGet())
         }
         val ainitFile = File(dir, "ainit.bin")
         if (afmp4) {
             if (!ainitFile.exists() || ainitFile.length() == 0L) {
-                ainitFile.writeBytes(fetchBytes(amedia!!.mapUrl!!, item, 0, -1))
+                ainitFile.writeBytes(fetchBytes(amedia!!.mapUrl!!, item, amedia.mapStart, amedia.mapLen))
             }
             report(done.incrementAndGet())
         }
@@ -140,7 +140,7 @@ object Downloader {
                             if (s.keyMethod == "AES-128" && s.keyUri != null) {
                                 data = decrypt(data, keyFor(s.keyUri), ivFor(s))
                             }
-                            if (t.stripHeader) data = stripFakeHeader(data)
+                            if (t.stripHeader) data = stripFakeHeader(stripId3(data))
                             val tmp = File(dir, t.name.removeSuffix(".seg") + ".tmp")
                             tmp.writeBytes(data)
                             if (!tmp.renameTo(out)) throw IOException("파일 저장 실패")
@@ -258,31 +258,42 @@ object Downloader {
     /** HTTP 오류 (재시도 판단용) */
     private class HttpErr(val code: Int, val retryAfterMs: Long) : IOException("HTTP $code")
 
+    /** 브라우저 헤더(Origin/Sec-Fetch)를 거부하고 최소 헤더에만 응답하는 호스트 */
+    private val lightHosts: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
     internal suspend fun fetchBytes(
         url: String, item: VideoItem, start: Long, len: Long,
         onThrottle: ((Exception) -> Unit)? = null
     ): ByteArray {
         var last: Exception? = null
         val max = 7
+        val host = Http.hostOf(url)
         for (attempt in 0 until max) {
             currentCoroutineContext().ensureActive()
+            // 브라우저 헤더와 최소 헤더를 번갈아 시도. 최소 헤더로만 되는 호스트는 기억해서
+            // 이후 조각은 처음부터 최소 헤더로 받는다 (안 그러면 조각마다 500 을 여러 번 맞고
+            // 백오프하느라 다운로드가 수십 배 느려짐)
+            val preferLight = host in lightHosts
+            val light = (attempt % 2 == 1) != preferLight
             try {
-                // 앞쪽 시도는 브라우저와 같은 헤더, 뒤쪽 시도(500 등이 계속될 때)는 최소 헤더로
-                val rb = Http.request(url, item, light = attempt >= 3)
+                val rb = Http.request(url, item, light = light)
                 if (len > 0) rb.header("Range", "bytes=$start-${start + len - 1}")
                 Http.client.newCall(rb.build()).execute().use { r ->
                     if (!r.isSuccessful) {
                         val ra = (r.header("Retry-After")?.trim()?.toLongOrNull() ?: 0L) * 1000L
                         throw HttpErr(r.code, ra)
                     }
-                    return r.body!!.bytes()
+                    val bytes = r.body!!.bytes()
+                    if (light && !preferLight && last is HttpErr) lightHosts.add(host)
+                    return bytes
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 last = e
                 // 속도 제한/서버 오류/연결 끊김이면 호출 측이 동시성을 낮출 수 있게 알림
-                if (e !is HttpErr || e.code == 429 || e.code >= 500) onThrottle?.invoke(e)
+                // (브라우저 헤더로 받은 5xx 는 헤더 거부일 수 있으므로 제한으로 보지 않음)
+                if (e !is HttpErr || e.code == 429 || (e.code >= 500 && light)) onThrottle?.invoke(e)
                 // 영구 오류(없음/권한/잘못된 요청)는 오래 재시도하지 않음
                 if (e is HttpErr && (e.code == 404 || e.code == 410 || e.code == 400) && attempt >= 1) break
                 if (attempt == max - 1) break
@@ -324,6 +335,24 @@ object Downloader {
         val payload = uri.substringAfter("base64,", "")
         if (payload.isEmpty()) throw IOException("지원하지 않는 키 형식")
         return Base64.decode(payload, Base64.DEFAULT)
+    }
+
+    /**
+     * 패킹된 오디오(.aac 조각) 앞의 ID3 태그(타임스탬프 정보)를 제거.
+     * 남겨 두면 조각을 이어 붙인 파일에서 두 번째 조각의 ID3 를 만나는 순간 오디오 읽기가 끝나
+     * 첫 조각(수 초) 뒤로 소리가 사라진다.
+     * ID3 의 시작 시각(PRIV transportStreamTimestamp)은 쓰지 않으므로 영상과 소리의 시작 차이만큼
+     * (보통 수십 ms) 어긋날 수 있다. 더 정확히 맞춰야 하면 그 값으로 오디오 시간을 보정할 것.
+     */
+    private fun stripId3(d: ByteArray): ByteArray {
+        var p = 0
+        while (d.size - p >= 10 && d[p] == 0x49.toByte() && d[p + 1] == 0x44.toByte() && d[p + 2] == 0x33.toByte()) {
+            val size = (d[p + 6].toInt() and 0x7f shl 21) or (d[p + 7].toInt() and 0x7f shl 14) or
+                (d[p + 8].toInt() and 0x7f shl 7) or (d[p + 9].toInt() and 0x7f)
+            val footer = if (d[p + 5].toInt() and 0x10 != 0) 10 else 0
+            p += 10 + size + footer
+        }
+        return if (p == 0) d else d.copyOfRange(minOf(p, d.size), d.size)
     }
 
     /** 일부 사이트는 TS 앞에 가짜 이미지 헤더를 붙임 -> 0x47 동기 바이트 위치부터 사용 */
