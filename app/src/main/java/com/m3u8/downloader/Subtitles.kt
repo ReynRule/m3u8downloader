@@ -92,6 +92,14 @@ object SubtitleParser {
         return ParsedSubs(normalize(parseBlocks(text, offset)), mapped)
     }
 
+    /**
+     * 시크바 미리보기용 썸네일 VTT(thumbnails.vtt)의 cue 본문: "thumbnails.jpg#xywh=0,0,160,90".
+     * 자막이 아니라 스프라이트 이미지의 좌표이므로 자막으로 넣으면 화면에 글자로 찍힌다.
+     */
+    private val thumbCueRe = Regex("""^\S+#xywh=\d+,\d+,\d+,\d+$""", RegexOption.IGNORE_CASE)
+
+    fun isThumbnailCue(body: String): Boolean = thumbCueRe.matches(body.trim())
+
     private fun parseBlocks(text: String, offset: Long): List<Cue> {
         val out = ArrayList<Cue>()
         for (block in text.split(Regex("\n{2,}"))) {
@@ -109,6 +117,7 @@ object SubtitleParser {
             val t = timingLine(lines[ti]) ?: continue
             val body = clean(lines.drop(ti + 1).joinToString("\n"))
             if (body.isEmpty()) continue
+            if (isThumbnailCue(body)) continue
             out.add(Cue(t.first + offset, t.second + offset, body))
         }
         return out
