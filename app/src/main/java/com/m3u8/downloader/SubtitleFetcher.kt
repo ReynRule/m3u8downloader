@@ -19,8 +19,15 @@ object SubtitleFetcher {
     private const val MAX_TRACKS = 8
     private const val MAX_SEGMENTS = 6000
 
+    private val thumbNameRe = Regex("(thumb|sprite|storyboard)", RegexOption.IGNORE_CASE)
+
+    /** 시크바 미리보기용 VTT(thumbnails.vtt 등)는 자막이 아니다 */
+    private fun isThumbnailTrack(t: SubTrack): Boolean =
+        thumbNameRe.containsMatchIn(t.url.substringBefore('?').substringAfterLast('/'))
+
     fun candidates(item: VideoItem): List<SubTrack> =
-        (item.subs + Detector.subsForPage(item.pageUrl)).distinctBy { it.url }.take(MAX_TRACKS)
+        (item.subs + Detector.subsForPage(item.pageUrl)).distinctBy { it.url }
+            .filterNot { isThumbnailTrack(it) }.take(MAX_TRACKS)
 
     /** 실패한 자막은 건너뛴다 (영상 다운로드 자체는 실패시키지 않음) */
     suspend fun collect(item: VideoItem): List<LoadedSub> {
